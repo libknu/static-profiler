@@ -71,9 +71,10 @@ static void log_indirect_callsite(const std::string &tu,
 static void log_syscall_site(const std::string &tu,
                              const std::string &caller,
                              const std::string &site_kind,
-                             const std::string &callee) {
+                             const std::string &callee,
+                             const std::string &syscall_nr) {
     append_line(join_path(g_outdir, g_syscall_file),
-                tu + "," + caller + "," + site_kind + "," + callee);
+                tu + "," + caller + "," + site_kind + "," + callee + "," + syscall_nr);
 }
 
 static bool is_explicit_syscall_callee(const char *callee) {
@@ -81,10 +82,6 @@ static bool is_explicit_syscall_callee(const char *callee) {
     return std::strcmp(callee, "syscall") == 0;
 }
 
-/*
- * Return the direct callee name if this CALL_INSN is a direct call to SYMBOL_REF.
- * Otherwise return nullptr.
- */
 static const char *get_direct_callee_name(rtx_insn *insn) {
     rtx call = PATTERN(insn);
     if (!call)
@@ -134,10 +131,6 @@ static const char *get_direct_callee_name(rtx_insn *insn) {
     return nullptr;
 }
 
-/*
- * Extract the call target rtx if possible.
- * This is used for indirect call-site inventory.
- */
 static rtx get_call_target(rtx_insn *insn) {
     rtx call = PATTERN(insn);
     if (!call)
@@ -190,14 +183,59 @@ static std::string classify_call_target(rtx target) {
 
     if (code == SYMBOL_REF)
         return "symbol_ref";
-
     if (code == REG)
         return "reg";
-
     if (code == SUBREG)
         return "subreg";
 
     return GET_RTX_NAME(code);
+}
+
+/*
+ * Very conservative extraction:
+ * - if RTL exposes a PARALLEL with USE operands containing CONST_INT,
+ *   return the first CONST_INT found.
+ * - otherwise "unknown"
+ *
+ * This is intentionally weak but safe for Milestone 5.
+ */
+static std::string extract_syscall_nr_from_call_insn(rtx_insn *insn) {
+    rtx pat = PATTERN(insn);
+    if (!pat)
+        return "unknown";
+
+    if (GET_CODE(pat) == PARALLEL) {
+        int len = XVECLEN(pat, 0);
+        for (int i = 0; i < len; ++i) {
+            rtx elem = XVECEXP(pat, 0, i);
+            if (!elem)
+                continue;
+
+            if (GET_CODE(elem) == USE) {
+                rtx x = XEXP(elem, 0);
+                if (x && GET_CODE(x) == CONST_INT) {
+                    return std::to_string((long long) INTVAL(x));
+                }
+            }
+
+            if (GET_CODE(elem) == SET) {
+                rtx src = SET_SRC(elem);
+                if (src && GET_CODE(src) == CONST_INT) {
+                    return std::to_string((long long) INTVAL(src));
+                }
+            }
+        }
+    }
+
+    rtx set = single_set(insn);
+    if (set) {
+        rtx src = SET_SRC(set);
+        if (src && GET_CODE(src) == CONST_INT) {
+            return std::to_string((long long) INTVAL(src));
+        }
+    }
+
+    return "unknown";
 }
 
 namespace {
@@ -238,9 +276,11 @@ public:
                         log_direct_edge(tu, caller, callee_str);
 
                         if (is_explicit_syscall_callee(callee)) {
+                            std::string nr = extract_syscall_nr_from_call_insn(insn);
                             log_syscall_site(tu, caller,
                                              "explicit-syscall-func",
-                                             callee_str);
+                                             callee_str,
+                                             nr);
                         }
                     } else {
                         rtx target = get_call_target(insn);
@@ -261,8 +301,8 @@ public:
 } // anonymous namespace
 
 static struct plugin_info my_plugin_info = {
-    "0.3",
-    "Milestone 1/2/3/4 plugin: function inventory + direct edges + indirect call sites + explicit syscall() detection"
+    "0.4",
+    "Milestone 1/2/3/4/5 plugin: function inventory + direct edges + indirect call sites + explicit syscall() detection + syscall nr extraction"
 };
 
 int plugin_init(struct plugin_name_args *plugin_info,
