@@ -78,39 +78,31 @@ static void log_syscall_site(const std::string &tu,
 }
 
 static bool is_explicit_syscall_callee(const char *callee) {
-    if (!callee) return false;
-    return std::strcmp(callee, "syscall") == 0;
+    return callee && std::strcmp(callee, "syscall") == 0;
 }
 
 static const char *get_direct_callee_name(rtx_insn *insn) {
     rtx call = PATTERN(insn);
-    if (!call)
-        return nullptr;
+    if (!call) return nullptr;
 
     rtx expr = nullptr;
     rtx set = single_set(insn);
-    if (set) {
-        expr = SET_SRC(set);
-    } else {
-        expr = call;
-    }
+    if (set) expr = SET_SRC(set);
+    else expr = call;
 
-    if (!expr)
-        return nullptr;
+    if (!expr) return nullptr;
 
     if (GET_CODE(expr) == CALL) {
         rtx target = XEXP(expr, 0);
 
         if (target && GET_CODE(target) == MEM) {
             rtx mem_target = XEXP(target, 0);
-            if (mem_target && GET_CODE(mem_target) == SYMBOL_REF) {
+            if (mem_target && GET_CODE(mem_target) == SYMBOL_REF)
                 return XSTR(mem_target, 0);
-            }
         }
 
-        if (target && GET_CODE(target) == SYMBOL_REF) {
+        if (target && GET_CODE(target) == SYMBOL_REF)
             return XSTR(target, 0);
-        }
     }
 
     if (GET_CODE(call) == CALL) {
@@ -118,14 +110,12 @@ static const char *get_direct_callee_name(rtx_insn *insn) {
 
         if (target && GET_CODE(target) == MEM) {
             rtx mem_target = XEXP(target, 0);
-            if (mem_target && GET_CODE(mem_target) == SYMBOL_REF) {
+            if (mem_target && GET_CODE(mem_target) == SYMBOL_REF)
                 return XSTR(mem_target, 0);
-            }
         }
 
-        if (target && GET_CODE(target) == SYMBOL_REF) {
+        if (target && GET_CODE(target) == SYMBOL_REF)
             return XSTR(target, 0);
-        }
     }
 
     return nullptr;
@@ -133,105 +123,131 @@ static const char *get_direct_callee_name(rtx_insn *insn) {
 
 static rtx get_call_target(rtx_insn *insn) {
     rtx call = PATTERN(insn);
-    if (!call)
-        return nullptr;
+    if (!call) return nullptr;
 
     rtx expr = nullptr;
     rtx set = single_set(insn);
-    if (set) {
-        expr = SET_SRC(set);
-    } else {
-        expr = call;
-    }
+    if (set) expr = SET_SRC(set);
+    else expr = call;
 
-    if (!expr)
-        return nullptr;
+    if (!expr) return nullptr;
 
-    if (GET_CODE(expr) == CALL) {
+    if (GET_CODE(expr) == CALL)
         return XEXP(expr, 0);
-    }
 
-    if (GET_CODE(call) == CALL) {
+    if (GET_CODE(call) == CALL)
         return XEXP(call, 0);
-    }
 
     return nullptr;
 }
 
 static std::string classify_call_target(rtx target) {
-    if (!target)
-        return "unknown";
+    if (!target) return "unknown";
 
     enum rtx_code code = GET_CODE(target);
 
     if (code == MEM) {
         rtx inner = XEXP(target, 0);
-        if (!inner)
-            return "mem";
+        if (!inner) return "mem";
 
         enum rtx_code inner_code = GET_CODE(inner);
-        if (inner_code == SYMBOL_REF)
-            return "mem-symbol_ref";
-        if (inner_code == REG)
-            return "mem-reg";
-        if (inner_code == PLUS)
-            return "mem-plus";
-        if (inner_code == SUBREG)
-            return "mem-subreg";
+        if (inner_code == SYMBOL_REF) return "mem-symbol_ref";
+        if (inner_code == REG) return "mem-reg";
+        if (inner_code == PLUS) return "mem-plus";
+        if (inner_code == SUBREG) return "mem-subreg";
         return std::string("mem-") + GET_RTX_NAME(inner_code);
     }
 
-    if (code == SYMBOL_REF)
-        return "symbol_ref";
-    if (code == REG)
-        return "reg";
-    if (code == SUBREG)
-        return "subreg";
+    if (code == SYMBOL_REF) return "symbol_ref";
+    if (code == REG) return "reg";
+    if (code == SUBREG) return "subreg";
 
     return GET_RTX_NAME(code);
 }
 
-/*
- * Very conservative extraction:
- * - if RTL exposes a PARALLEL with USE operands containing CONST_INT,
- *   return the first CONST_INT found.
- * - otherwise "unknown"
- *
- * This is intentionally weak but safe for Milestone 5.
- */
-static std::string extract_syscall_nr_from_call_insn(rtx_insn *insn) {
-    rtx pat = PATTERN(insn);
-    if (!pat)
+static bool is_x86_64_first_arg_reg(rtx x) {
+    if (!x) return false;
+
+    if (GET_CODE(x) == SUBREG)
+        x = SUBREG_REG(x);
+
+    if (GET_CODE(x) != REG)
+        return false;
+
+    return REGNO(x) == 5;   // x86_64 SysV first integer/pointer arg: rdi/edi/di
+}
+
+static std::string extract_syscall_nr_from_call_insn(rtx_insn *call_insn) {
+    if (!call_insn)
         return "unknown";
 
-    if (GET_CODE(pat) == PARALLEL) {
+    /* Fast path: inspect call pattern/use list first. */
+    rtx pat = PATTERN(call_insn);
+    if (pat && GET_CODE(pat) == PARALLEL) {
         int len = XVECLEN(pat, 0);
         for (int i = 0; i < len; ++i) {
             rtx elem = XVECEXP(pat, 0, i);
-            if (!elem)
-                continue;
+            if (!elem) continue;
 
             if (GET_CODE(elem) == USE) {
-                rtx x = XEXP(elem, 0);
-                if (x && GET_CODE(x) == CONST_INT) {
-                    return std::to_string((long long) INTVAL(x));
-                }
-            }
-
-            if (GET_CODE(elem) == SET) {
-                rtx src = SET_SRC(elem);
-                if (src && GET_CODE(src) == CONST_INT) {
-                    return std::to_string((long long) INTVAL(src));
+                rtx used = XEXP(elem, 0);
+                if (used && is_x86_64_first_arg_reg(used)) {
+                    /* found the arg register in the use list; actual const is likely in prior insn */
+                    break;
                 }
             }
         }
     }
 
-    rtx set = single_set(insn);
-    if (set) {
-        rtx src = SET_SRC(set);
-        if (src && GET_CODE(src) == CONST_INT) {
+    /* Main path: scan a few insns backward for (set (reg 5 di) (const_int N)) */
+    int budget = 12;
+    for (rtx_insn *prev = PREV_INSN(call_insn); prev && budget-- > 0; prev = PREV_INSN(prev)) {
+        if (!INSN_P(prev))
+            continue;
+
+        rtx set = single_set(prev);
+        if (!set)
+            continue;
+
+        rtx dest = SET_DEST(set);
+        rtx src  = SET_SRC(set);
+
+        if (!is_x86_64_first_arg_reg(dest))
+            continue;
+
+        if (src && GET_CODE(src) == CONST_INT)
             return std::to_string((long long) INTVAL(src));
+
+        /* simple copy propagation: mov rdi, regX then look backward for regX = const_int */
+        if (src && (GET_CODE(src) == REG || GET_CODE(src) == SUBREG)) {
+            rtx src_reg = src;
+            if (GET_CODE(src_reg) == SUBREG)
+                src_reg = SUBREG_REG(src_reg);
+
+            if (GET_CODE(src_reg) == REG) {
+                unsigned src_regno = REGNO(src_reg);
+                int budget2 = 12;
+
+                for (rtx_insn *prev2 = PREV_INSN(prev); prev2 && budget2-- > 0; prev2 = PREV_INSN(prev2)) {
+                    if (!INSN_P(prev2))
+                        continue;
+
+                    rtx set2 = single_set(prev2);
+                    if (!set2)
+                        continue;
+
+                    rtx dest2 = SET_DEST(set2);
+                    rtx src2  = SET_SRC(set2);
+
+                    if (GET_CODE(dest2) == SUBREG)
+                        dest2 = SUBREG_REG(dest2);
+
+                    if (GET_CODE(dest2) == REG && REGNO(dest2) == src_regno) {
+                        if (src2 && GET_CODE(src2) == CONST_INT)
+                            return std::to_string((long long) INTVAL(src2));
+                    }
+                }
+            }
         }
     }
 
@@ -256,9 +272,7 @@ class callsite_rtl_pass : public rtl_opt_pass {
 public:
     callsite_rtl_pass(gcc::context *ctx) : rtl_opt_pass(my_pass_data, ctx) {}
 
-    bool gate(function *) override {
-        return true;
-    }
+    bool gate(function *) override { return true; }
 
     unsigned int execute(function *) override {
         std::string tu = get_current_tu_name();
@@ -301,8 +315,8 @@ public:
 } // anonymous namespace
 
 static struct plugin_info my_plugin_info = {
-    "0.4",
-    "Milestone 1/2/3/4/5 plugin: function inventory + direct edges + indirect call sites + explicit syscall() detection + syscall nr extraction"
+    "0.5",
+    "Milestone 1/2/3/4/5 plugin"
 };
 
 int plugin_init(struct plugin_name_args *plugin_info,
@@ -317,9 +331,8 @@ int plugin_init(struct plugin_name_args *plugin_info,
         const char *value = plugin_info->argv[i].value;
         if (!key || !value) continue;
 
-        if (std::strcmp(key, "outdir") == 0) {
+        if (std::strcmp(key, "outdir") == 0)
             g_outdir = value;
-        }
     }
 
     register_callback(plugin_info->base_name,
@@ -338,9 +351,6 @@ int plugin_init(struct plugin_name_args *plugin_info,
                       nullptr,
                       &pass_info);
 
-    std::fprintf(stderr,
-                 "[callsite_plugin] loaded, outdir=%s\n",
-                 g_outdir.c_str());
-
+    std::fprintf(stderr, "[callsite_plugin] loaded, outdir=%s\n", g_outdir.c_str());
     return 0;
 }
