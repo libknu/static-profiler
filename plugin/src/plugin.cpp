@@ -24,6 +24,7 @@ static std::string g_outdir = ".";
 static std::string g_functions_file = "functions_seen.csv";
 static std::string g_direct_file = "direct_edges.csv";
 static std::string g_indirect_file = "indirect_callsites.csv";
+static std::string g_syscall_file = "syscall_sites.csv";
 
 static std::string join_path(const std::string &a, const std::string &b) {
     if (a.empty()) return b;
@@ -65,6 +66,19 @@ static void log_indirect_callsite(const std::string &tu,
                                   const std::string &target_code) {
     append_line(join_path(g_outdir, g_indirect_file),
                 tu + "," + caller + "," + target_code);
+}
+
+static void log_syscall_site(const std::string &tu,
+                             const std::string &caller,
+                             const std::string &site_kind,
+                             const std::string &callee) {
+    append_line(join_path(g_outdir, g_syscall_file),
+                tu + "," + caller + "," + site_kind + "," + callee);
+}
+
+static bool is_explicit_syscall_callee(const char *callee) {
+    if (!callee) return false;
+    return std::strcmp(callee, "syscall") == 0;
 }
 
 /*
@@ -164,9 +178,9 @@ static std::string classify_call_target(rtx target) {
 
         enum rtx_code inner_code = GET_CODE(inner);
         if (inner_code == SYMBOL_REF)
-            return "mem-symbol_ref";   // direct call through mem(symbol_ref)
+            return "mem-symbol_ref";
         if (inner_code == REG)
-            return "mem-reg";          // likely indirect
+            return "mem-reg";
         if (inner_code == PLUS)
             return "mem-plus";
         if (inner_code == SUBREG)
@@ -189,15 +203,15 @@ static std::string classify_call_target(rtx target) {
 namespace {
 
 const pass_data my_pass_data = {
-    RTL_PASS,                 /* type */
-    "callsite_rtl_pass",      /* name */
-    OPTGROUP_NONE,            /* optinfo_flags */
-    TV_NONE,                  /* tv_id */
-    PROP_rtl,                 /* properties_required */
-    0,                        /* properties_provided */
-    0,                        /* properties_destroyed */
-    0,                        /* todo_flags_start */
-    0                         /* todo_flags_finish */
+    RTL_PASS,
+    "callsite_rtl_pass",
+    OPTGROUP_NONE,
+    TV_NONE,
+    PROP_rtl,
+    0,
+    0,
+    0,
+    0
 };
 
 class callsite_rtl_pass : public rtl_opt_pass {
@@ -220,7 +234,14 @@ public:
                 if (CALL_P(insn)) {
                     const char *callee = get_direct_callee_name(insn);
                     if (callee) {
-                        log_direct_edge(tu, caller, std::string(callee));
+                        std::string callee_str(callee);
+                        log_direct_edge(tu, caller, callee_str);
+
+                        if (is_explicit_syscall_callee(callee)) {
+                            log_syscall_site(tu, caller,
+                                             "explicit-syscall-func",
+                                             callee_str);
+                        }
                     } else {
                         rtx target = get_call_target(insn);
                         std::string target_code = classify_call_target(target);
@@ -240,8 +261,8 @@ public:
 } // anonymous namespace
 
 static struct plugin_info my_plugin_info = {
-    "0.2",
-    "Milestone 1/2/3 plugin: function inventory + direct edges + indirect call sites"
+    "0.3",
+    "Milestone 1/2/3/4 plugin: function inventory + direct edges + indirect call sites + explicit syscall() detection"
 };
 
 int plugin_init(struct plugin_name_args *plugin_info,
