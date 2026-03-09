@@ -81,6 +81,13 @@ static bool is_explicit_syscall_callee(const char *callee) {
     return callee && std::strcmp(callee, "syscall") == 0;
 }
 
+static bool is_glibc_syscall_wrapper(const char *callee) {
+    if (!callee) return false;
+
+    // First M8 known-wrapper set.
+    return std::strcmp(callee, "__syscall_cancel") == 0;
+}
+
 static const char *get_direct_callee_name(rtx_insn *insn) {
     rtx call = PATTERN(insn);
     if (!call) return nullptr;
@@ -174,32 +181,35 @@ static bool is_x86_64_first_arg_reg(rtx x) {
     if (GET_CODE(x) != REG)
         return false;
 
-    return REGNO(x) == 5;   // x86_64 SysV first integer/pointer arg: rdi/edi/di
+    // x86_64 SysV first integer/pointer arg register = rdi/edi/di
+    return REGNO(x) == 5;
 }
 
-static std::string extract_syscall_nr_from_call_insn(rtx_insn *call_insn) {
+static bool is_stack_push_mem(rtx x) {
+    if (!x) return false;
+    if (GET_CODE(x) != MEM) return false;
+
+    rtx addr = XEXP(x, 0);
+    if (!addr) return false;
+
+    // We care first about:
+    //   (mem (pre_dec sp))
+    if (GET_CODE(addr) == PRE_DEC) {
+        rtx base = XEXP(addr, 0);
+        return base && GET_CODE(base) == REG && REGNO(base) == STACK_POINTER_REGNUM;
+    }
+
+    return false;
+}
+
+/*
+ * Existing M5 explicit syscall() nr extraction:
+ * syscall(SYS_xxx, ...) => first arg in rdi
+ */
+static std::string extract_syscall_nr_from_explicit_syscall_call(rtx_insn *call_insn) {
     if (!call_insn)
         return "unknown";
 
-    /* Fast path: inspect call pattern/use list first. */
-    rtx pat = PATTERN(call_insn);
-    if (pat && GET_CODE(pat) == PARALLEL) {
-        int len = XVECLEN(pat, 0);
-        for (int i = 0; i < len; ++i) {
-            rtx elem = XVECEXP(pat, 0, i);
-            if (!elem) continue;
-
-            if (GET_CODE(elem) == USE) {
-                rtx used = XEXP(elem, 0);
-                if (used && is_x86_64_first_arg_reg(used)) {
-                    /* found the arg register in the use list; actual const is likely in prior insn */
-                    break;
-                }
-            }
-        }
-    }
-
-    /* Main path: scan a few insns backward for (set (reg 5 di) (const_int N)) */
     int budget = 12;
     for (rtx_insn *prev = PREV_INSN(call_insn); prev && budget-- > 0; prev = PREV_INSN(prev)) {
         if (!INSN_P(prev))
@@ -218,7 +228,7 @@ static std::string extract_syscall_nr_from_call_insn(rtx_insn *call_insn) {
         if (src && GET_CODE(src) == CONST_INT)
             return std::to_string((long long) INTVAL(src));
 
-        /* simple copy propagation: mov rdi, regX then look backward for regX = const_int */
+        // simple copy propagation: rdi <- regX ; earlier regX <- const_int N
         if (src && (GET_CODE(src) == REG || GET_CODE(src) == SUBREG)) {
             rtx src_reg = src;
             if (GET_CODE(src_reg) == SUBREG)
@@ -248,6 +258,42 @@ static std::string extract_syscall_nr_from_call_insn(rtx_insn *call_insn) {
                     }
                 }
             }
+        }
+    }
+
+    return "unknown";
+}
+
+/*
+ * New M8 extraction for glibc cancellation wrapper:
+ *
+ * For patterns like read.c:
+ *   sp = sp - 8
+ *   (mem (pre_dec sp)) = const_int 0
+ *   call __syscall_cancel
+ *
+ * That pushed const_int is the syscall number.
+ */
+static std::string extract_syscall_nr_from_syscall_cancel_call(rtx_insn *call_insn) {
+    if (!call_insn)
+        return "unknown";
+
+    int budget = 16;
+    for (rtx_insn *prev = PREV_INSN(call_insn); prev && budget-- > 0; prev = PREV_INSN(prev)) {
+        if (!INSN_P(prev))
+            continue;
+
+        rtx set = single_set(prev);
+        if (!set)
+            continue;
+
+        rtx dest = SET_DEST(set);
+        rtx src  = SET_SRC(set);
+
+        // Most direct pattern:
+        //   (set (mem (pre_dec sp)) (const_int N))
+        if (is_stack_push_mem(dest) && src && GET_CODE(src) == CONST_INT) {
+            return std::to_string((long long) INTVAL(src));
         }
     }
 
@@ -290,9 +336,15 @@ public:
                         log_direct_edge(tu, caller, callee_str);
 
                         if (is_explicit_syscall_callee(callee)) {
-                            std::string nr = extract_syscall_nr_from_call_insn(insn);
+                            std::string nr = extract_syscall_nr_from_explicit_syscall_call(insn);
                             log_syscall_site(tu, caller,
                                              "explicit-syscall-func",
+                                             callee_str,
+                                             nr);
+                        } else if (is_glibc_syscall_wrapper(callee)) {
+                            std::string nr = extract_syscall_nr_from_syscall_cancel_call(insn);
+                            log_syscall_site(tu, caller,
+                                             "glibc-wrapper",
                                              callee_str,
                                              nr);
                         }
@@ -315,8 +367,8 @@ public:
 } // anonymous namespace
 
 static struct plugin_info my_plugin_info = {
-    "0.5",
-    "Milestone 1/2/3/4/5 plugin"
+    "0.6",
+    "Milestone 1-5 + M8 pattern-based glibc syscall wrapper detection"
 };
 
 int plugin_init(struct plugin_name_args *plugin_info,
