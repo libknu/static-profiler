@@ -2,12 +2,13 @@
 
 GCC RTL 패스 기반 정적 분석 프로젝트입니다.
 
-이 PR 범위의 분석 단계는 **Step B/C까지만** 포함합니다.
+현재 저장소에는 **Step B/C + PR1(=Step D1)** 까지 포함합니다.
 
 - Step A: GCC 플러그인 추출 (기존/외부)
 - Step B: direct edge 역방향 순회로 syscall 도달 가능 함수 집합 계산
 - Step C: Step B 결과를 사용해 syscall 관련 indirect callsite만 필터링
-- Step D 이후(간접 타깃 해석/반복 고정점)는 **범위 밖**
+- Step D1(PR1): coarse address-taken 후보 유니버스 + callsite 정규화 + 초기 후보 산출
+- Step D2 이후는 **범위 밖**
 
 ## 입력 데이터
 
@@ -42,3 +43,20 @@ python -m pytest -q
 ```
 
 테스트는 Step B/C만 검증합니다.
+
+
+## PR1 / Step D1 실행 (coarse address-taken universe)
+
+```bash
+python scripts/run_step_d_pr1.py \
+  --syscall-related-indirect out/step_bc/syscall_related_indirect_callsites.csv \
+  --functions-seen out/2.41/functions_seen.csv \
+  --out-address-taken out/step_d/address_taken_functions.csv \
+  --out-normalized-callsites out/step_d/indirect_callsites_normalized.csv \
+  --out-candidates out/step_d/indirect_candidates_pr1.csv
+```
+
+출력:
+- `address_taken_functions.csv`: PR1에서의 coarse 후보 유니버스 (`functions_seen.csv` 기반 bootstrap)
+- `indirect_callsites_normalized.csv`: callsite 중심 정규화 스키마
+- `indirect_candidates_pr1.csv`: 각 callsite에 대한 coarse 후보 집합 (LOW confidence)
