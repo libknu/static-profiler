@@ -77,15 +77,48 @@ static void log_syscall_site(const std::string &tu,
                 tu + "," + caller + "," + site_kind + "," + callee + "," + syscall_nr);
 }
 
-static bool is_explicit_syscall_callee(const char *callee) {
-    return callee && std::strcmp(callee, "syscall") == 0;
+enum WrapperKind {
+    WRAP_NONE = 0,
+    WRAP_EXPLICIT_SYSCALL,
+    WRAP_SYSCALL_CANCEL,
+    WRAP_INTERNAL_SYSCALL_CANCEL,
+    WRAP_SYSCALL_CANCEL_ARCH,
+    WRAP_NOCANCEL_HELPER
+};
+
+static WrapperKind classify_wrapper(const char *callee) {
+    if (!callee) return WRAP_NONE;
+
+    if (std::strcmp(callee, "syscall") == 0)
+        return WRAP_EXPLICIT_SYSCALL;
+
+    if (std::strcmp(callee, "__syscall_cancel") == 0)
+        return WRAP_SYSCALL_CANCEL;
+
+    if (std::strcmp(callee, "__internal_syscall_cancel") == 0)
+        return WRAP_INTERNAL_SYSCALL_CANCEL;
+
+    if (std::strcmp(callee, "__syscall_cancel_arch") == 0)
+        return WRAP_SYSCALL_CANCEL_ARCH;
+
+    if (std::strstr(callee, "nocancel") != nullptr)
+        return WRAP_NOCANCEL_HELPER;
+
+    return WRAP_NONE;
 }
 
-static bool is_glibc_syscall_wrapper(const char *callee) {
-    if (!callee) return false;
-
-    // First M8 known-wrapper set.
-    return std::strcmp(callee, "__syscall_cancel") == 0;
+static const char *wrapper_kind_to_site_kind(WrapperKind k) {
+    switch (k) {
+        case WRAP_EXPLICIT_SYSCALL:
+            return "explicit-syscall-func";
+        case WRAP_SYSCALL_CANCEL:
+        case WRAP_INTERNAL_SYSCALL_CANCEL:
+        case WRAP_SYSCALL_CANCEL_ARCH:
+        case WRAP_NOCANCEL_HELPER:
+            return "glibc-wrapper";
+        default:
+            return "unknown";
+    }
 }
 
 static const char *get_direct_callee_name(rtx_insn *insn) {
@@ -181,8 +214,7 @@ static bool is_x86_64_first_arg_reg(rtx x) {
     if (GET_CODE(x) != REG)
         return false;
 
-    // x86_64 SysV first integer/pointer arg register = rdi/edi/di
-    return REGNO(x) == 5;
+    return REGNO(x) == 5;  // rdi
 }
 
 static bool is_stack_push_mem(rtx x) {
@@ -192,8 +224,6 @@ static bool is_stack_push_mem(rtx x) {
     rtx addr = XEXP(x, 0);
     if (!addr) return false;
 
-    // We care first about:
-    //   (mem (pre_dec sp))
     if (GET_CODE(addr) == PRE_DEC) {
         rtx base = XEXP(addr, 0);
         return base && GET_CODE(base) == REG && REGNO(base) == STACK_POINTER_REGNUM;
@@ -202,10 +232,6 @@ static bool is_stack_push_mem(rtx x) {
     return false;
 }
 
-/*
- * Existing M5 explicit syscall() nr extraction:
- * syscall(SYS_xxx, ...) => first arg in rdi
- */
 static std::string extract_syscall_nr_from_explicit_syscall_call(rtx_insn *call_insn) {
     if (!call_insn)
         return "unknown";
@@ -228,7 +254,6 @@ static std::string extract_syscall_nr_from_explicit_syscall_call(rtx_insn *call_
         if (src && GET_CODE(src) == CONST_INT)
             return std::to_string((long long) INTVAL(src));
 
-        // simple copy propagation: rdi <- regX ; earlier regX <- const_int N
         if (src && (GET_CODE(src) == REG || GET_CODE(src) == SUBREG)) {
             rtx src_reg = src;
             if (GET_CODE(src_reg) == SUBREG)
@@ -264,16 +289,6 @@ static std::string extract_syscall_nr_from_explicit_syscall_call(rtx_insn *call_
     return "unknown";
 }
 
-/*
- * New M8 extraction for glibc cancellation wrapper:
- *
- * For patterns like read.c:
- *   sp = sp - 8
- *   (mem (pre_dec sp)) = const_int 0
- *   call __syscall_cancel
- *
- * That pushed const_int is the syscall number.
- */
 static std::string extract_syscall_nr_from_syscall_cancel_call(rtx_insn *call_insn) {
     if (!call_insn)
         return "unknown";
@@ -290,10 +305,164 @@ static std::string extract_syscall_nr_from_syscall_cancel_call(rtx_insn *call_in
         rtx dest = SET_DEST(set);
         rtx src  = SET_SRC(set);
 
-        // Most direct pattern:
-        //   (set (mem (pre_dec sp)) (const_int N))
         if (is_stack_push_mem(dest) && src && GET_CODE(src) == CONST_INT) {
             return std::to_string((long long) INTVAL(src));
+        }
+    }
+
+    return "unknown";
+}
+
+static const char *safe_asm_string(rtx x) {
+    if (!x) return nullptr;
+#if defined(ASM_OPERANDS_TEMPLATE)
+    return ASM_OPERANDS_TEMPLATE(x);
+#else
+    return nullptr;
+#endif
+}
+
+static int asm_input_count(rtx x) {
+#if defined(ASM_OPERANDS_INPUT_LENGTH)
+    return ASM_OPERANDS_INPUT_LENGTH(x);
+#else
+    (void)x;
+    return 0;
+#endif
+}
+
+static rtx asm_input_rtx(rtx x, int idx) {
+#if defined(ASM_OPERANDS_INPUT)
+    return ASM_OPERANDS_INPUT(x, idx);
+#else
+    (void)x; (void)idx;
+    return nullptr;
+#endif
+}
+
+static bool string_contains_syscall(const char *s) {
+    return s && std::strstr(s, "syscall") != nullptr;
+}
+
+static rtx find_asm_operands_in_setsrc(rtx src) {
+    if (!src) return nullptr;
+
+    if (GET_CODE(src) == ASM_OPERANDS)
+        return src;
+
+    if (GET_CODE(src) == SUBREG)
+        return find_asm_operands_in_setsrc(SUBREG_REG(src));
+
+    return nullptr;
+}
+
+static rtx find_syscall_asm_operands(rtx_insn *insn) {
+    if (!insn) return nullptr;
+
+    rtx pat = PATTERN(insn);
+    if (!pat) return nullptr;
+
+    if (GET_CODE(pat) == SET) {
+        rtx src = SET_SRC(pat);
+        rtx asmop = find_asm_operands_in_setsrc(src);
+        if (asmop && string_contains_syscall(safe_asm_string(asmop)))
+            return asmop;
+    }
+
+    if (GET_CODE(pat) == PARALLEL) {
+        int len = XVECLEN(pat, 0);
+        for (int i = 0; i < len; ++i) {
+            rtx elem = XVECEXP(pat, 0, i);
+            if (!elem) continue;
+
+            if (GET_CODE(elem) == SET) {
+                rtx src = SET_SRC(elem);
+                rtx asmop = find_asm_operands_in_setsrc(src);
+                if (asmop && string_contains_syscall(safe_asm_string(asmop)))
+                    return asmop;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+static rtx normalize_reg_like(rtx x) {
+    if (!x) return nullptr;
+    if (GET_CODE(x) == SUBREG)
+        x = SUBREG_REG(x);
+    return x;
+}
+
+static std::string extract_syscall_nr_from_inline_syscall_insn(rtx_insn *insn) {
+    rtx asmop = find_syscall_asm_operands(insn);
+    if (!asmop)
+        return "unknown";
+
+    int ninputs = asm_input_count(asmop);
+    if (ninputs <= 0)
+        return "unknown";
+
+    rtx nr_input = asm_input_rtx(asmop, 0);
+    if (!nr_input)
+        return "unknown";
+
+    nr_input = normalize_reg_like(nr_input);
+
+    if (GET_CODE(nr_input) == CONST_INT) {
+        return std::to_string((long long) INTVAL(nr_input));
+    }
+
+    if (GET_CODE(nr_input) != REG)
+        return "unknown";
+
+    unsigned nr_regno = REGNO(nr_input);
+
+    int budget = 16;
+    for (rtx_insn *prev = PREV_INSN(insn); prev && budget-- > 0; prev = PREV_INSN(prev)) {
+        if (!INSN_P(prev))
+            continue;
+
+        rtx set = single_set(prev);
+        if (!set)
+            continue;
+
+        rtx dest = normalize_reg_like(SET_DEST(set));
+        rtx src  = SET_SRC(set);
+
+        if (!dest || GET_CODE(dest) != REG)
+            continue;
+
+        if (REGNO(dest) != nr_regno)
+            continue;
+
+        if (src && GET_CODE(src) == CONST_INT)
+            return std::to_string((long long) INTVAL(src));
+
+        if (src && (GET_CODE(src) == REG || GET_CODE(src) == SUBREG)) {
+            rtx src_reg = normalize_reg_like(src);
+            if (src_reg && GET_CODE(src_reg) == REG) {
+                unsigned src_regno = REGNO(src_reg);
+                int budget2 = 12;
+
+                for (rtx_insn *prev2 = PREV_INSN(prev); prev2 && budget2-- > 0; prev2 = PREV_INSN(prev2)) {
+                    if (!INSN_P(prev2))
+                        continue;
+
+                    rtx set2 = single_set(prev2);
+                    if (!set2)
+                        continue;
+
+                    rtx dest2 = normalize_reg_like(SET_DEST(set2));
+                    rtx src2  = SET_SRC(set2);
+
+                    if (!dest2 || GET_CODE(dest2) != REG)
+                        continue;
+
+                    if (REGNO(dest2) == src_regno && src2 && GET_CODE(src2) == CONST_INT)
+                        return std::to_string((long long) INTVAL(src2));
+                }
+            }
         }
     }
 
@@ -329,30 +498,59 @@ public:
         basic_block bb;
         FOR_ALL_BB_FN(bb, cfun) {
             for (rtx_insn *insn = BB_HEAD(bb); insn; insn = NEXT_INSN(insn)) {
+                // 1) normal call-based handling
                 if (CALL_P(insn)) {
                     const char *callee = get_direct_callee_name(insn);
                     if (callee) {
                         std::string callee_str(callee);
                         log_direct_edge(tu, caller, callee_str);
 
-                        if (is_explicit_syscall_callee(callee)) {
-                            std::string nr = extract_syscall_nr_from_explicit_syscall_call(insn);
-                            log_syscall_site(tu, caller,
-                                             "explicit-syscall-func",
-                                             callee_str,
-                                             nr);
-                        } else if (is_glibc_syscall_wrapper(callee)) {
-                            std::string nr = extract_syscall_nr_from_syscall_cancel_call(insn);
-                            log_syscall_site(tu, caller,
-                                             "glibc-wrapper",
-                                             callee_str,
-                                             nr);
+                        WrapperKind wk = classify_wrapper(callee);
+                        switch (wk) {
+                            case WRAP_EXPLICIT_SYSCALL: {
+                                std::string nr = extract_syscall_nr_from_explicit_syscall_call(insn);
+                                log_syscall_site(tu, caller,
+                                                 wrapper_kind_to_site_kind(wk),
+                                                 callee_str,
+                                                 nr);
+                                break;
+                            }
+                            case WRAP_SYSCALL_CANCEL: {
+                                std::string nr = extract_syscall_nr_from_syscall_cancel_call(insn);
+                                log_syscall_site(tu, caller,
+                                                 wrapper_kind_to_site_kind(wk),
+                                                 callee_str,
+                                                 nr);
+                                break;
+                            }
+                            case WRAP_INTERNAL_SYSCALL_CANCEL:
+                            case WRAP_SYSCALL_CANCEL_ARCH:
+                            case WRAP_NOCANCEL_HELPER: {
+                                log_syscall_site(tu, caller,
+                                                 wrapper_kind_to_site_kind(wk),
+                                                 callee_str,
+                                                 "unknown");
+                                break;
+                            }
+                            case WRAP_NONE:
+                            default:
+                                break;
                         }
                     } else {
                         rtx target = get_call_target(insn);
                         std::string target_code = classify_call_target(target);
                         log_indirect_callsite(tu, caller, target_code);
                     }
+                }
+
+                // 2) inline-asm syscall handling
+                rtx asmop = find_syscall_asm_operands(insn);
+                if (asmop) {
+                    std::string nr = extract_syscall_nr_from_inline_syscall_insn(insn);
+                    log_syscall_site(tu, caller,
+                                     "glibc-inline-syscall",
+                                     "inline-asm",
+                                     nr);
                 }
 
                 if (insn == BB_END(bb))
@@ -367,8 +565,8 @@ public:
 } // anonymous namespace
 
 static struct plugin_info my_plugin_info = {
-    "0.6",
-    "Milestone 1-5 + M8 pattern-based glibc syscall wrapper detection"
+    "0.7",
+    "Milestone 1-5 + M8 + M10 inline-asm syscall support"
 };
 
 int plugin_init(struct plugin_name_args *plugin_info,
