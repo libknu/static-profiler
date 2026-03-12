@@ -2,13 +2,14 @@
 
 GCC RTL 패스 기반 정적 분석 프로젝트입니다.
 
-현재 저장소에는 **Step B/C + PR1(=Step D1)** 까지 포함합니다.
+현재 저장소에는 **Step B/C + PR1(D1) + PR2(D2)** 까지 포함합니다.
 
 - Step A: GCC 플러그인 추출 (기존/외부)
 - Step B: direct edge 역방향 순회로 syscall 도달 가능 함수 집합 계산
 - Step C: Step B 결과를 사용해 syscall 관련 indirect callsite만 필터링
 - Step D1(PR1): coarse address-taken 후보 유니버스 + callsite 정규화 + 초기 후보 산출
-- Step D2 이후는 **범위 밖**
+- Step D2(PR2): explicit function-pointer fact 통합 + hard/soft 후보 분리
+- Step D3 이후는 **범위 밖**
 
 ## 입력 데이터
 
@@ -60,3 +61,23 @@ python scripts/run_step_d_pr1.py \
 - `address_taken_functions.csv`: PR1에서의 coarse 후보 유니버스 (`functions_seen.csv` 기반 bootstrap)
 - `indirect_callsites_normalized.csv`: callsite 중심 정규화 스키마
 - `indirect_candidates_pr1.csv`: 각 callsite에 대한 coarse 후보 집합 (LOW confidence)
+
+
+## PR2 / Step D2 실행 (explicit function-pointer facts 통합)
+
+```bash
+python scripts/run_step_d_pr2.py \
+  --syscall-related-indirect out/step_bc/syscall_related_indirect_callsites.csv \
+  --functions-seen out/2.41/functions_seen.csv \
+  --explicit-fp-facts out/step_d/input_fp_facts.csv \
+  --out-address-taken out/step_d/address_taken_functions.csv \
+  --out-normalized-callsites out/step_d/indirect_callsites_normalized.csv \
+  --out-fp-assignment-facts out/step_d/fp_assignment_facts.csv \
+  --out-candidates out/step_d/indirect_candidates_pr2.csv
+```
+
+출력:
+- `fp_assignment_facts.csv`: explicit function-pointer assignment 정규화 결과
+- `indirect_candidates_pr2.csv`: callsite별 hard/soft 후보 집합 + primary source/confidence
+
+`--explicit-fp-facts`를 생략하면 PR2는 PR1 coarse 후보를 유지하고 explicit facts 출력은 헤더만 생성합니다.
