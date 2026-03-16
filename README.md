@@ -2,7 +2,7 @@
 
 GCC RTL 패스 기반 정적 분석 프로젝트입니다.
 
-이 저장소는 Step B/C와 보수적 Step D(exact resolve)까지 포함합니다.
+이 저장소는 Step B/C와 Step D(동일 함수 로컬 resolver)까지 포함합니다.
 
 - Step A: GCC 플러그인 추출 (기존/외부)
 - Step B: direct edge 역방향 순회로 syscall 도달 가능 함수 집합 계산
@@ -45,23 +45,34 @@ python scripts/run_step_d_defuse_from_rtl.py \
   --out out/step_d/defuse_events.csv
 ```
 
-## Step D exact resolve 실행
+## Step D local resolve 실행
 
-`indirect_callsites.csv`와 insn-level def/use CSV를 입력으로 받아, 동일 함수 내 최근 def를 역추적해
-`SYMBOL_REF(<func>)` 단일값인 경우만 `exact`로 확정합니다.
-escape/alias/phi/merge가 관측되거나 정보가 부족하면 `unresolved`로 처리합니다.
+`syscall-reachable indirect callsites.csv`와 `defuse_events.csv`를 입력으로 받아,
+동일 함수 안에서만 target operand를 backward trace 합니다.
+
+지원 범위:
+- `REG <- SYMBOL_REF(func)` => `direct-symbol`
+- `REGa <- REGb` copy chain을 따라가 최종 `SYMBOL_REF(func)`에 도달 => `reg-copy-chain`
+- 그 외(memory/merge/unknown/ambiguous 포함) => `unresolved`
+
+제한 사항:
+- 인터프로시저 전파 없음
+- 포인터/alias 분석 없음
+- memory 기반 추적 없음
+- 보수적으로 해석 불가 시 즉시 `unresolved`
 
 ```bash
-python scripts/run_step_d_exact_resolve.py \
-  --indirect-callsites out/2.41/indirect_callsites.csv \
+python scripts/run_step_d_local_resolve.py \
+  --indirect-callsites out/2.41/syscall_related_indirect_callsites.csv \
   --defuse-csv out/2.41/defuse_events.csv \
   --out out/step_d/resolved_indirect_callsites.csv
 ```
 
 출력 CSV는 입력 컬럼 뒤에 아래 컬럼을 추가합니다.
 
-- `resolution_status` (`exact` 또는 `unresolved`)
-- `resolved_target` (exact일 때 함수명, 아니면 빈 값)
+- `resolution_class` (`direct-symbol`, `reg-copy-chain`, `unresolved`)
+- `resolved_target` (resolve 성공 시 함수명, 아니면 빈 값)
+- `stop_reason` (unresolved 사유)
 
 ## 출력
 
@@ -76,4 +87,4 @@ python scripts/run_step_d_exact_resolve.py \
 python -m pytest -q
 ```
 
-테스트는 Step B/C 및 Step D exact resolver 동작을 검증합니다.
+테스트는 Step B/C 및 Step D local resolver 동작을 검증합니다.
