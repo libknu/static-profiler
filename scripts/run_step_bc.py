@@ -13,24 +13,30 @@ from analysis.step_bc_pipeline import run_step_bc
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Run Step B/C analysis only")
-    p.add_argument("--direct-edges", required=True)
-    p.add_argument("--syscall-sites", required=True)
-    p.add_argument("--indirect-callsites", required=True)
-    p.add_argument("--out-reachable", default="out/syscall_reachable_functions.csv")
-    p.add_argument("--out-related-indirect", default="out/syscall_related_indirect_callsites.csv")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description="Run Step B/C analysis only")
+    parser.add_argument("--direct-edges", required=True)
+    parser.add_argument("--syscall-sites", required=True)
+    parser.add_argument("--indirect-callsites", required=True)
+    parser.add_argument(
+        "--out-reachable",
+        default="out/syscall_reachable_functions.csv",
+    )
+    parser.add_argument(
+        "--out-related-indirect",
+        default="out/syscall_related_indirect_callsites.csv",
+    )
+    args = parser.parse_args()
 
-    reachable, related = run_step_bc(
-        direct_edges_csv=args.direct_edges,
-        syscall_sites_csv=args.syscall_sites,
-        indirect_callsites_csv=args.indirect_callsites,
-        out_reachable_csv=args.out_reachable,
-        out_related_indirect_csv=args.out_related_indirect,
+    reachable_count, related_count = run_step_bc(
+        direct_edges_csv=Path(args.direct_edges),
+        syscall_sites_csv=Path(args.syscall_sites),
+        indirect_callsites_csv=Path(args.indirect_callsites),
+        out_reachable_csv=Path(args.out_reachable),
+        out_filtered_indirect_csv=Path(args.out_related_indirect),
     )
 
-    print(f"reachable_functions={len(reachable)}")
-    print(f"related_indirect_sites={len(related)}")
+    print(f"reachable_functions={reachable_count}")
+    print(f"related_indirect_sites={related_count}")
 
 
 if __name__ == "__main__":

@@ -1,140 +1,153 @@
 from __future__ import annotations
 
+import csv
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Set, Tuple
-import csv
-
-
-def read_direct_edges(path: str) -> Set[Tuple[str, str]]:
-    """Read direct edge CSV rows as (caller, callee). Expects tu,caller,callee."""
-    edges: Set[Tuple[str, str]] = set()
-    with open(path, newline="") as f:
-        for row in csv.reader(f):
-            if len(row) < 3:
-                continue
-            _tu, caller, callee = row[:3]
-            edges.add((caller, callee))
-    return edges
-
-
-def read_syscall_sink_functions(path: str) -> Set[str]:
-    """Read syscall sink functions from syscall_sites.csv (tu,caller,site_kind,callee,syscall_nr)."""
-    sinks: Set[str] = set()
-    with open(path, newline="") as f:
-        for row in csv.reader(f):
-            if len(row) < 2:
-                continue
-            _tu, function = row[:2]
-            sinks.add(function)
-    return sinks
 
 
 def compute_syscall_reachable_functions(
-    direct_edges: Iterable[Tuple[str, str]],
-    sink_functions: Iterable[str],
-) -> Set[str]:
-    reverse_graph: Dict[str, Set[str]] = defaultdict(set)
-    for caller, callee in direct_edges:
-        reverse_graph[callee].add(caller)
+    direct_edges_csv: str | Path,
+    syscall_sites_csv: str | Path,
+    output_csv: str | Path,
+) -> set[str]:
+    """
+    Step B:
+    Compute the set of functions that can reach a syscall site through
+    zero or more direct-call edges.
 
-    reachable: Set[str] = set(sink_functions)
-    q = deque(reachable)
+    direct_edges.csv columns:
+        tu,caller,callee
 
-    while q:
-        callee = q.popleft()
+    syscall_sites.csv columns:
+        tu,function,site_kind,callee,syscall_nr
+
+    output syscall_reachable_functions.csv columns:
+        function
+    """
+    reverse_graph: dict[str, set[str]] = defaultdict(set)
+
+    with open(direct_edges_csv, "r", newline="") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row or len(row) < 3:
+                continue
+
+            _, caller, callee = row[:3]
+
+            if caller == "caller" and callee == "callee":
+                # tolerate accidental header row
+                continue
+
+            caller = caller.strip()
+            callee = callee.strip()
+            if caller and callee:
+                reverse_graph[callee].add(caller)
+
+    syscall_funcs: set[str] = set()
+    with open(syscall_sites_csv, "r", newline="") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row or len(row) < 2:
+                continue
+
+            # syscall_sites.csv: tu,function,site_kind,callee,syscall_nr
+            fn = row[1].strip()
+            if fn and fn != "function":
+                syscall_funcs.add(fn)
+
+    reachable: set[str] = set(syscall_funcs)
+    worklist = deque(syscall_funcs)
+
+    while worklist:
+        callee = worklist.popleft()
         for caller in reverse_graph.get(callee, ()):
             if caller not in reachable:
                 reachable.add(caller)
-                q.append(caller)
+                worklist.append(caller)
+
+    with open(output_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["function"])
+        for fn in sorted(reachable):
+            writer.writerow([fn])
 
     return reachable
 
 
-def read_indirect_callsites(path: str) -> Tuple[List[str], List[List[str]]]:
-    """Read indirect callsite CSV with header auto-detection.
+def _load_reachable_functions(syscall_reachable_functions_csv: str | Path) -> set[str]:
+    reachable: set[str] = set()
 
-    Returns (header, rows). Header is [] if absent.
-    """
-    with open(path, newline="") as f:
-        rows = [row for row in csv.reader(f) if row]
+    with open(syscall_reachable_functions_csv, "r", newline="") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row:
+                continue
 
-    if not rows:
-        return [], []
+            fn = row[0].strip()
+            if not fn or fn == "function":
+                continue
 
-    first = rows[0]
-    lower = [c.strip().lower() for c in first]
-    has_header = "function" in lower or "site_id" in lower or "insn_uid" in lower
+            reachable.add(fn)
 
-    if has_header:
-        return first, rows[1:]
-
-    return [], rows
-
-
-def _function_column_index(header: Sequence[str]) -> int:
-    if not header:
-        return 1  # current repo sample format: tu,function,target_code
-
-    lowered = [c.strip().lower() for c in header]
-    if "function" in lowered:
-        return lowered.index("function")
-    if "caller" in lowered:
-        return lowered.index("caller")
-    return 1
+    return reachable
 
 
 def filter_syscall_related_indirect_callsites(
-    header: Sequence[str],
-    rows: Iterable[Sequence[str]],
-    reachable_functions: Set[str],
-) -> List[List[str]]:
-    idx = _function_column_index(header)
-    out: List[List[str]] = []
-    for row in rows:
-        if len(row) <= idx:
-            continue
-        if row[idx] in reachable_functions:
-            out.append(list(row))
-    return out
+    indirect_callsites_csv: str | Path,
+    syscall_reachable_functions_csv: str | Path,
+    output_csv: str | Path,
+) -> int:
+    """
+    Step C:
+    Filter indirect callsites to only those whose enclosing function is
+    syscall-reachable.
 
+    Important:
+    - Preserve the full input row shape.
+    - Support both:
+        old format: tu,function,target_code
+        new format: tu,function,bb,insn_idx,loc,target_code
+    - Input is treated as headerless.
+    """
+    reachable = _load_reachable_functions(syscall_reachable_functions_csv)
+    kept = 0
 
-def write_single_column_csv(path: str, column_name: str, values: Iterable[str]) -> None:
-    out_path = Path(path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([column_name])
-        for v in sorted(set(values)):
-            w.writerow([v])
+    with open(indirect_callsites_csv, "r", newline="") as fin, open(output_csv, "w", newline="") as fout:
+        reader = csv.reader(fin)
+        writer = csv.writer(fout)
 
+        for row in reader:
+            if not row or len(row) < 2:
+                continue
 
-def write_rows_csv(path: str, header: Sequence[str], rows: Iterable[Sequence[str]]) -> None:
-    out_path = Path(path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", newline="") as f:
-        w = csv.writer(f)
-        if header:
-            w.writerow(list(header))
-        for row in rows:
-            w.writerow(list(row))
+            fn = row[1].strip()
+            if not fn or fn == "function":
+                continue
+
+            if fn in reachable:
+                writer.writerow(row)
+                kept += 1
+
+    return kept
 
 
 def run_step_bc(
-    direct_edges_csv: str,
-    syscall_sites_csv: str,
-    indirect_callsites_csv: str,
-    out_reachable_csv: str,
-    out_related_indirect_csv: str,
-) -> Tuple[Set[str], List[List[str]]]:
-    edges = read_direct_edges(direct_edges_csv)
-    sinks = read_syscall_sink_functions(syscall_sites_csv)
-    reachable = compute_syscall_reachable_functions(edges, sinks)
+    direct_edges_csv: str | Path,
+    syscall_sites_csv: str | Path,
+    indirect_callsites_csv: str | Path,
+    out_reachable_csv: str | Path,
+    out_filtered_indirect_csv: str | Path,
+) -> tuple[int, int]:
+    reachable = compute_syscall_reachable_functions(
+        direct_edges_csv=direct_edges_csv,
+        syscall_sites_csv=syscall_sites_csv,
+        output_csv=out_reachable_csv,
+    )
 
-    header, indirect_rows = read_indirect_callsites(indirect_callsites_csv)
-    related_indirect = filter_syscall_related_indirect_callsites(header, indirect_rows, reachable)
+    kept = filter_syscall_related_indirect_callsites(
+        indirect_callsites_csv=indirect_callsites_csv,
+        syscall_reachable_functions_csv=out_reachable_csv,
+        output_csv=out_filtered_indirect_csv,
+    )
 
-    write_single_column_csv(out_reachable_csv, "function", reachable)
-    write_rows_csv(out_related_indirect_csv, header, related_indirect)
-
-    return reachable, related_indirect
+    return len(reachable), kept
