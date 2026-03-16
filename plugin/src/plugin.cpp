@@ -13,10 +13,15 @@
 #include "tree-pass.h"
 #include "cfghooks.h"
 
+#include "gimple.h"
+#include "gimple-iterator.h"
+#include "tree-ssa.h"
+
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <fstream>
+#include <sstream>
 
 int plugin_is_GPL_compatible;
 
@@ -25,6 +30,29 @@ static std::string g_functions_file = "functions_seen.csv";
 static std::string g_direct_file = "direct_edges.csv";
 static std::string g_indirect_file = "indirect_callsites.csv";
 static std::string g_syscall_file = "syscall_sites.csv";
+
+/* New outputs for local indirect-call resolution */
+static std::string g_indirect_operands_file = "indirect_call_operands.csv";
+/*
+ * columns:
+ *   tu,function,bb,stmt_idx,loc,callee_kind,callee_value
+ */
+static std::string g_local_defs_file = "local_value_defs.csv";
+/*
+ * columns:
+ *   tu,function,lhs_ssa,def_kind,rhs_value,loc
+ *
+ * def_kind:
+ *   direct_addr
+ *   copy
+ *   call_result
+ *   unknown
+ */
+static std::string g_local_phi_file = "local_phi_edges.csv";
+/*
+ * columns:
+ *   tu,function,lhs_ssa,arg_index,arg_kind,arg_value,loc
+ */
 
 static std::string join_path(const std::string &a, const std::string &b) {
     if (a.empty()) return b;
@@ -50,22 +78,60 @@ static std::string get_current_tu_name() {
     return src ? std::string(src) : std::string("<unknown-tu>");
 }
 
+static std::string sanitize_csv(const std::string &s) {
+    std::string out = s;
+    for (char &c : out) {
+        if (c == ',' || c == '\n' || c == '\r')
+            c = '_';
+    }
+    return out;
+}
+
+static std::string get_location_string(location_t loc) {
+    if (loc == UNKNOWN_LOCATION)
+        return "unknown";
+
+    expanded_location xloc = expand_location(loc);
+    std::ostringstream oss;
+    if (xloc.file)
+        oss << xloc.file;
+    else
+        oss << "unknown";
+    oss << ":" << xloc.line << ":" << xloc.column;
+    return oss.str();
+}
+
+static std::string get_rtl_location_string(rtx_insn *insn) {
+    if (!insn)
+        return "unknown";
+
+    location_t loc = INSN_LOCATION(insn);
+    return get_location_string(loc);
+}
+
 static void log_function_seen(const std::string &tu, const std::string &fn) {
-    append_line(join_path(g_outdir, g_functions_file), tu + "," + fn);
+    append_line(join_path(g_outdir, g_functions_file),
+                sanitize_csv(tu) + "," + sanitize_csv(fn));
 }
 
 static void log_direct_edge(const std::string &tu,
                             const std::string &caller,
                             const std::string &callee) {
     append_line(join_path(g_outdir, g_direct_file),
-                tu + "," + caller + "," + callee);
+                sanitize_csv(tu) + "," + sanitize_csv(caller) + "," +
+                sanitize_csv(callee));
 }
 
 static void log_indirect_callsite(const std::string &tu,
                                   const std::string &caller,
+                                  int bb_index,
+                                  int insn_idx,
+                                  const std::string &loc,
                                   const std::string &target_code) {
     append_line(join_path(g_outdir, g_indirect_file),
-                tu + "," + caller + "," + target_code);
+                sanitize_csv(tu) + "," + sanitize_csv(caller) + "," +
+                std::to_string(bb_index) + "," + std::to_string(insn_idx) + "," +
+                sanitize_csv(loc) + "," + sanitize_csv(target_code));
 }
 
 static void log_syscall_site(const std::string &tu,
@@ -74,7 +140,49 @@ static void log_syscall_site(const std::string &tu,
                              const std::string &callee,
                              const std::string &syscall_nr) {
     append_line(join_path(g_outdir, g_syscall_file),
-                tu + "," + caller + "," + site_kind + "," + callee + "," + syscall_nr);
+                sanitize_csv(tu) + "," + sanitize_csv(caller) + "," +
+                sanitize_csv(site_kind) + "," + sanitize_csv(callee) + "," +
+                sanitize_csv(syscall_nr));
+}
+
+static void log_indirect_call_operand(const std::string &tu,
+                                      const std::string &caller,
+                                      int bb_index,
+                                      int stmt_idx,
+                                      const std::string &loc,
+                                      const std::string &callee_kind,
+                                      const std::string &callee_value) {
+    append_line(join_path(g_outdir, g_indirect_operands_file),
+                sanitize_csv(tu) + "," + sanitize_csv(caller) + "," +
+                std::to_string(bb_index) + "," + std::to_string(stmt_idx) + "," +
+                sanitize_csv(loc) + "," + sanitize_csv(callee_kind) + "," +
+                sanitize_csv(callee_value));
+}
+
+static void log_local_value_def(const std::string &tu,
+                                const std::string &caller,
+                                const std::string &lhs_ssa,
+                                const std::string &def_kind,
+                                const std::string &rhs_value,
+                                const std::string &loc) {
+    append_line(join_path(g_outdir, g_local_defs_file),
+                sanitize_csv(tu) + "," + sanitize_csv(caller) + "," +
+                sanitize_csv(lhs_ssa) + "," + sanitize_csv(def_kind) + "," +
+                sanitize_csv(rhs_value) + "," + sanitize_csv(loc));
+}
+
+static void log_local_phi_edge(const std::string &tu,
+                               const std::string &caller,
+                               const std::string &lhs_ssa,
+                               int arg_index,
+                               const std::string &arg_kind,
+                               const std::string &arg_value,
+                               const std::string &loc) {
+    append_line(join_path(g_outdir, g_local_phi_file),
+                sanitize_csv(tu) + "," + sanitize_csv(caller) + "," +
+                sanitize_csv(lhs_ssa) + "," + std::to_string(arg_index) + "," +
+                sanitize_csv(arg_kind) + "," + sanitize_csv(arg_value) + "," +
+                sanitize_csv(loc));
 }
 
 enum WrapperKind {
@@ -469,7 +577,246 @@ static std::string extract_syscall_nr_from_inline_syscall_insn(rtx_insn *insn) {
     return "unknown";
 }
 
+/* ------------------------------------------------------------------------- */
+/* GIMPLE / SSA helpers for local indirect-call resolution                    */
+/* ------------------------------------------------------------------------- */
+
+static std::string function_decl_name(tree t) {
+    if (!t || TREE_CODE(t) != FUNCTION_DECL)
+        return "<non-function>";
+    tree name = DECL_NAME(t);
+    if (!name) return "<anon-function>";
+    const char *s = IDENTIFIER_POINTER(name);
+    return s ? std::string(s) : std::string("<anon-function>");
+}
+
+static std::string ssa_name_id(tree t) {
+    if (!t || TREE_CODE(t) != SSA_NAME)
+        return "<non-ssa>";
+
+    std::ostringstream oss;
+    tree var = SSA_NAME_VAR(t);
+
+    if (var && DECL_P(var) && DECL_NAME(var)) {
+        oss << IDENTIFIER_POINTER(DECL_NAME(var));
+    } else {
+        oss << "ssa";
+    }
+
+    oss << "_" << SSA_NAME_VERSION(t);
+    return oss.str();
+}
+
+static tree strip_simple_casts(tree t) {
+    while (t) {
+        enum tree_code code = TREE_CODE(t);
+        if (code == NOP_EXPR ||
+            code == CONVERT_EXPR ||
+            code == NON_LVALUE_EXPR ||
+            code == VIEW_CONVERT_EXPR) {
+            t = TREE_OPERAND(t, 0);
+            continue;
+        }
+        break;
+    }
+    return t;
+}
+
+static void classify_value_tree(tree t, std::string &kind, std::string &value) {
+    t = strip_simple_casts(t);
+
+    if (!t) {
+        kind = "unknown";
+        value = "null";
+        return;
+    }
+
+    switch (TREE_CODE(t)) {
+        case SSA_NAME:
+            kind = "ssa";
+            value = ssa_name_id(t);
+            return;
+
+        case FUNCTION_DECL:
+            kind = "direct_addr";
+            value = function_decl_name(t);
+            return;
+
+        case ADDR_EXPR: {
+            tree op = TREE_OPERAND(t, 0);
+            op = strip_simple_casts(op);
+            if (op && TREE_CODE(op) == FUNCTION_DECL) {
+                kind = "direct_addr";
+                value = function_decl_name(op);
+                return;
+            }
+            kind = "addr_expr";
+            value = get_tree_code_name(TREE_CODE(op));
+            return;
+        }
+
+        case INTEGER_CST:
+            kind = "const";
+            value = "integer_cst";
+            return;
+
+        default:
+            kind = "expr";
+            value = get_tree_code_name(TREE_CODE(t));
+            return;
+    }
+}
+
+static void maybe_log_gimple_assign_def(const std::string &tu,
+                                        const std::string &caller,
+                                        gimple *stmt) {
+    if (!is_gimple_assign(stmt))
+        return;
+
+    tree lhs = gimple_assign_lhs(stmt);
+    if (!lhs || TREE_CODE(lhs) != SSA_NAME)
+        return;
+
+    std::string lhs_id = ssa_name_id(lhs);
+    std::string loc = get_location_string(gimple_location(stmt));
+
+    /*
+     * Minimal D1 scope:
+     *   - lhs = foo
+     *   - lhs = &foo
+     *   - lhs = rhs_ssa
+     *   - lhs = (cast) rhs_ssa
+     *   - everything else -> unknown
+     */
+    tree rhs1 = gimple_assign_rhs1(stmt);
+    std::string rhs_kind, rhs_value;
+    classify_value_tree(rhs1, rhs_kind, rhs_value);
+
+    if (rhs_kind == "direct_addr") {
+        log_local_value_def(tu, caller, lhs_id, "direct_addr", rhs_value, loc);
+        return;
+    }
+
+    if (rhs_kind == "ssa") {
+        log_local_value_def(tu, caller, lhs_id, "copy", rhs_value, loc);
+        return;
+    }
+
+    log_local_value_def(tu, caller, lhs_id, "unknown", rhs_value, loc);
+}
+
+static void maybe_log_gimple_call_result_def(const std::string &tu,
+                                             const std::string &caller,
+                                             gimple *stmt) {
+    if (!is_gimple_call(stmt))
+        return;
+
+    tree lhs = gimple_call_lhs(stmt);
+    if (!lhs || TREE_CODE(lhs) != SSA_NAME)
+        return;
+
+    std::string lhs_id = ssa_name_id(lhs);
+    std::string loc = get_location_string(gimple_location(stmt));
+
+    /* local-only resolver cannot resolve interprocedural call result */
+    log_local_value_def(tu, caller, lhs_id, "call_result", "unknown", loc);
+}
+
+static void maybe_log_gimple_phi_edges(const std::string &tu,
+                                       const std::string &caller,
+                                       gimple *stmt) {
+    if (!stmt || gimple_code(stmt) != GIMPLE_PHI)
+        return;
+
+    gphi *phi = as_a<gphi *>(stmt);
+    tree lhs = gimple_phi_result(phi);
+    if (!lhs || TREE_CODE(lhs) != SSA_NAME)
+        return;
+
+    std::string lhs_id = ssa_name_id(lhs);
+    std::string loc = get_location_string(gimple_location(stmt));
+
+    unsigned nargs = gimple_phi_num_args(phi);
+    for (unsigned i = 0; i < nargs; ++i) {
+        tree arg = gimple_phi_arg_def(phi, i);
+        std::string arg_kind, arg_value;
+        classify_value_tree(arg, arg_kind, arg_value);
+        log_local_phi_edge(tu, caller, lhs_id, (int)i, arg_kind, arg_value, loc);
+    }
+}
+
+static void maybe_log_indirect_call_operand(const std::string &tu,
+                                            const std::string &caller,
+                                            int bb_index,
+                                            int stmt_idx,
+                                            gimple *stmt) {
+    if (!is_gimple_call(stmt))
+        return;
+
+    tree direct = gimple_call_fndecl(stmt);
+    if (direct)
+        return;
+
+    tree fn = gimple_call_fn(stmt);
+    std::string kind, value;
+    classify_value_tree(fn, kind, value);
+
+    std::string loc = get_location_string(gimple_location(stmt));
+    log_indirect_call_operand(tu, caller, bb_index, stmt_idx, loc, kind, value);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Passes                                                                     */
+/* ------------------------------------------------------------------------- */
+
 namespace {
+
+const pass_data local_facts_pass_data = {
+    GIMPLE_PASS,
+    "local_facts_gimple_pass",
+    OPTGROUP_NONE,
+    TV_NONE,
+    PROP_cfg | PROP_ssa,
+    0,
+    0,
+    0,
+    0
+};
+
+class local_facts_gimple_pass : public gimple_opt_pass {
+public:
+    local_facts_gimple_pass(gcc::context *ctx) : gimple_opt_pass(local_facts_pass_data, ctx) {}
+
+    bool gate(function *) override { return true; }
+
+    unsigned int execute(function *fun) override {
+        std::string tu = get_current_tu_name();
+        std::string caller = get_current_function_name();
+
+        basic_block bb;
+        FOR_ALL_BB_FN(bb, fun) {
+            for (gimple_stmt_iterator gsi = gsi_start_phis(bb);
+                 !gsi_end_p(gsi);
+                 gsi_next(&gsi)) {
+                gimple *stmt = gsi_stmt(gsi);
+                maybe_log_gimple_phi_edges(tu, caller, stmt);
+            }
+
+            int stmt_idx = 0;
+            for (gimple_stmt_iterator gsi = gsi_start_bb(bb);
+                 !gsi_end_p(gsi);
+                 gsi_next(&gsi), ++stmt_idx) {
+                gimple *stmt = gsi_stmt(gsi);
+
+                maybe_log_gimple_assign_def(tu, caller, stmt);
+                maybe_log_gimple_call_result_def(tu, caller, stmt);
+                maybe_log_indirect_call_operand(tu, caller, bb->index, stmt_idx, stmt);
+            }
+        }
+
+        return 0;
+    }
+};
 
 const pass_data my_pass_data = {
     RTL_PASS,
@@ -497,8 +844,9 @@ public:
 
         basic_block bb;
         FOR_ALL_BB_FN(bb, cfun) {
-            for (rtx_insn *insn = BB_HEAD(bb); insn; insn = NEXT_INSN(insn)) {
-                // 1) normal call-based handling
+            int insn_idx = 0;
+
+            for (rtx_insn *insn = BB_HEAD(bb); insn; insn = NEXT_INSN(insn), ++insn_idx) {
                 if (CALL_P(insn)) {
                     const char *callee = get_direct_callee_name(insn);
                     if (callee) {
@@ -539,11 +887,11 @@ public:
                     } else {
                         rtx target = get_call_target(insn);
                         std::string target_code = classify_call_target(target);
-                        log_indirect_callsite(tu, caller, target_code);
+                        std::string loc = get_rtl_location_string(insn);
+                        log_indirect_callsite(tu, caller, bb->index, insn_idx, loc, target_code);
                     }
                 }
 
-                // 2) inline-asm syscall handling
                 rtx asmop = find_syscall_asm_operands(insn);
                 if (asmop) {
                     std::string nr = extract_syscall_nr_from_inline_syscall_insn(insn);
@@ -565,8 +913,8 @@ public:
 } // anonymous namespace
 
 static struct plugin_info my_plugin_info = {
-    "0.7",
-    "Milestone 1-5 + M8 + M10 inline-asm syscall support"
+    "0.9",
+    "RTL callsite + GIMPLE local-facts extraction with site identity for indirect-call joins"
 };
 
 int plugin_init(struct plugin_name_args *plugin_info,
@@ -590,16 +938,27 @@ int plugin_init(struct plugin_name_args *plugin_info,
                       nullptr,
                       &my_plugin_info);
 
-    static struct register_pass_info pass_info;
-    pass_info.pass = new callsite_rtl_pass(g);
-    pass_info.reference_pass_name = "expand";
-    pass_info.ref_pass_instance_number = 1;
-    pass_info.pos_op = PASS_POS_INSERT_AFTER;
+    static struct register_pass_info gimple_pass_info;
+    gimple_pass_info.pass = new local_facts_gimple_pass(g);
+    gimple_pass_info.reference_pass_name = "ssa";
+    gimple_pass_info.ref_pass_instance_number = 1;
+    gimple_pass_info.pos_op = PASS_POS_INSERT_AFTER;
 
     register_callback(plugin_info->base_name,
                       PLUGIN_PASS_MANAGER_SETUP,
                       nullptr,
-                      &pass_info);
+                      &gimple_pass_info);
+
+    static struct register_pass_info rtl_pass_info;
+    rtl_pass_info.pass = new callsite_rtl_pass(g);
+    rtl_pass_info.reference_pass_name = "expand";
+    rtl_pass_info.ref_pass_instance_number = 1;
+    rtl_pass_info.pos_op = PASS_POS_INSERT_AFTER;
+
+    register_callback(plugin_info->base_name,
+                      PLUGIN_PASS_MANAGER_SETUP,
+                      nullptr,
+                      &rtl_pass_info);
 
     std::fprintf(stderr, "[callsite_plugin] loaded, outdir=%s\n", g_outdir.c_str());
     return 0;
