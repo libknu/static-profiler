@@ -29,6 +29,22 @@ python scripts/run_step_bc.py \
 ```
 
 
+## defuse_events.csv 자동 생성
+
+`defuse_events.csv`가 없으면 아래 둘 중 하나로 생성할 수 있습니다.
+
+1) **GCC plugin 사용 시 자동 생성**
+- 최신 plugin은 `outdir` 아래에 `defuse_events.csv`를 함께 기록합니다.
+- 또한 `indirect_callsites.csv`에 `insn_uid`, `target_operand` 컬럼을 함께 기록합니다.
+
+2) **RTL dump에서 추출**
+```bash
+python scripts/run_step_d_defuse_from_rtl.py \
+  --rtl-dump path/to/file.expand \
+  --tu path/to/file.c \
+  --out out/step_d/defuse_events.csv
+```
+
 ## Step D exact resolve 실행
 
 `indirect_callsites.csv`와 insn-level def/use CSV를 입력으로 받아, 동일 함수 내 최근 def를 역추적해

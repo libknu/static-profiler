@@ -25,6 +25,7 @@ static std::string g_functions_file = "functions_seen.csv";
 static std::string g_direct_file = "direct_edges.csv";
 static std::string g_indirect_file = "indirect_callsites.csv";
 static std::string g_syscall_file = "syscall_sites.csv";
+static std::string g_defuse_file = "defuse_events.csv";
 
 static std::string join_path(const std::string &a, const std::string &b) {
     if (a.empty()) return b;
@@ -63,9 +64,21 @@ static void log_direct_edge(const std::string &tu,
 
 static void log_indirect_callsite(const std::string &tu,
                                   const std::string &caller,
+                                  const std::string &insn_uid,
+                                  const std::string &target_operand,
                                   const std::string &target_code) {
     append_line(join_path(g_outdir, g_indirect_file),
-                tu + "," + caller + "," + target_code);
+                tu + "," + caller + "," + insn_uid + "," + target_operand + "," + target_code);
+}
+
+static void log_defuse_event(const std::string &tu,
+                             const std::string &caller,
+                             const std::string &insn_uid,
+                             const std::string &kind,
+                             const std::string &var,
+                             const std::string &value) {
+    append_line(join_path(g_outdir, g_defuse_file),
+                tu + "," + caller + "," + insn_uid + "," + kind + "," + var + "," + value);
 }
 
 static void log_syscall_site(const std::string &tu,
@@ -394,6 +407,60 @@ static rtx normalize_reg_like(rtx x) {
     return x;
 }
 
+static std::string reg_token(rtx x) {
+    x = normalize_reg_like(x);
+    if (!x || GET_CODE(x) != REG)
+        return "";
+    return std::string("REG(") + std::to_string((unsigned) REGNO(x)) + ")";
+}
+
+static std::string rtx_value_to_string(rtx x) {
+    if (!x)
+        return "";
+
+    if (GET_CODE(x) == SUBREG)
+        x = SUBREG_REG(x);
+
+    if (GET_CODE(x) == SYMBOL_REF) {
+        const char *s = XSTR(x, 0);
+        return std::string("SYMBOL_REF(") + (s ? s : "") + ")";
+    }
+
+    if (GET_CODE(x) == REG)
+        return reg_token(x);
+
+    if (GET_CODE(x) == CONST_INT)
+        return std::to_string((long long) INTVAL(x));
+
+    return GET_RTX_NAME(GET_CODE(x));
+}
+
+static std::string extract_call_target_operand(rtx target) {
+    if (!target)
+        return "";
+
+    if (GET_CODE(target) == MEM) {
+        rtx inner = XEXP(target, 0);
+        if (!inner)
+            return "";
+
+        if (GET_CODE(inner) == REG || GET_CODE(inner) == SUBREG)
+            return reg_token(inner);
+
+        if (GET_CODE(inner) == PLUS) {
+            rtx lhs = XEXP(inner, 0);
+            if (lhs && (GET_CODE(lhs) == REG || GET_CODE(lhs) == SUBREG))
+                return reg_token(lhs);
+        }
+        return "";
+    }
+
+    if (GET_CODE(target) == REG || GET_CODE(target) == SUBREG)
+        return reg_token(target);
+
+    return "";
+}
+
 static std::string extract_syscall_nr_from_inline_syscall_insn(rtx_insn *insn) {
     rtx asmop = find_syscall_asm_operands(insn);
     if (!asmop)
@@ -538,8 +605,36 @@ public:
                         }
                     } else {
                         rtx target = get_call_target(insn);
+                        std::string insn_uid = std::to_string((long long) INSN_UID(insn));
+                        std::string operand = extract_call_target_operand(target);
                         std::string target_code = classify_call_target(target);
-                        log_indirect_callsite(tu, caller, target_code);
+                        log_indirect_callsite(tu, caller, insn_uid, operand, target_code);
+
+                        if (!operand.empty()) {
+                            log_defuse_event(tu, caller, insn_uid, "call_arg", operand, "indirect-call-target");
+                        }
+                    }
+                }
+
+                // 1.5) def/use-like event extraction for Step D exact resolver
+                if (INSN_P(insn)) {
+                    rtx set = single_set(insn);
+                    if (set) {
+                        std::string insn_uid = std::to_string((long long) INSN_UID(insn));
+                        rtx dest = SET_DEST(set);
+                        rtx src = SET_SRC(set);
+
+                        std::string def_var = reg_token(dest);
+                        if (!def_var.empty()) {
+                            log_defuse_event(tu, caller, insn_uid, "def", def_var, rtx_value_to_string(src));
+                        }
+
+                        if (dest && GET_CODE(dest) == MEM) {
+                            std::string esc_var = reg_token(src);
+                            if (!esc_var.empty()) {
+                                log_defuse_event(tu, caller, insn_uid, "escape", esc_var, "store-to-mem");
+                            }
+                        }
                     }
                 }
 
@@ -589,6 +684,16 @@ int plugin_init(struct plugin_name_args *plugin_info,
                       PLUGIN_INFO,
                       nullptr,
                       &my_plugin_info);
+
+    // Per GCC invocation initialize headers.
+    {
+        std::ofstream ofs_indirect(join_path(g_outdir, g_indirect_file), std::ios::trunc);
+        ofs_indirect << "tu,function,insn_uid,target_operand,callee_kind\n";
+    }
+    {
+        std::ofstream ofs_defuse(join_path(g_outdir, g_defuse_file), std::ios::trunc);
+        ofs_defuse << "tu,function,insn_uid,kind,var,value\n";
+    }
 
     static struct register_pass_info pass_info;
     pass_info.pass = new callsite_rtl_pass(g);
