@@ -1,0 +1,6 @@
+tree-sitter
+tree-sitter-c
+langgraph
+requests
+typing-extensions
+openai
