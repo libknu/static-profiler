@@ -2,7 +2,7 @@ from langgraph.graph import StateGraph, START, END
 
 from .state import ResolverState
 from .bootlin import bootlin_ident
-from .treesitter_retriever import get_function_source
+from .treesitter_retriever import get_symbol_source
 from .analyzer import llm_analyze_step
 
 
@@ -32,7 +32,6 @@ def index_symbol(state: ResolverState) -> ResolverState:
         "observations": [f"{symbol} defined at {d['path']}:{d['line']} ({d['type']})"],
     }
 
-
 def retrieve_block(state: ResolverState) -> ResolverState:
     if state.get("hop_count", 0) > state.get("max_hops", 6):
         return {
@@ -41,27 +40,28 @@ def retrieve_block(state: ResolverState) -> ResolverState:
             "observations": ["stopped because max_hops was exceeded"],
         }
 
-    if state["current_kind"] != "function":
+    try:
+        block_text, block_kind = get_symbol_source(
+            project_root=state["project_root"],
+            relative_path=state["current_path"],
+            symbol=state["current_symbol"],
+            line_1_based=state["current_line"],
+            ident_kind=state["current_kind"],
+        )
+    except Exception as e:
         return {
             "status": "failed",
-            "final_answer": f"unsupported kind for current retriever: {state['current_kind']}",
-            "observations": [
-                f"retriever currently supports only function, got {state['current_kind']}"
-            ],
+            "final_answer": f"retrieval failed for {state['current_symbol']}: {e}",
+            "observations": [f"retrieval error: {e}"],
         }
-
-    block_text, block_kind = get_function_source(
-        project_root=state["project_root"],
-        relative_path=state["current_path"],
-        symbol=state["current_symbol"],
-        line_1_based=state["current_line"],
-    )
 
     return {
         "current_block": block_text,
         "current_block_kind": block_kind,
         "retrieved_chunks": [block_text],
-        "observations": [f"retrieved {block_kind} for {state['current_symbol']}"],
+        "observations": [
+            f"retrieved {block_kind} for {state['current_symbol']} ({state['current_kind']})"
+        ],
         "status": "running",
     }
 
