@@ -9,9 +9,11 @@ class ResolverState(TypedDict, total=False):
     version: str
     family: str
 
-    start_symbol: str
-    current_symbol: str
+    caller_symbol: str
+    icall_expr: str
+    icall_location: str
 
+    current_symbol: str
     current_path: str
     current_line: int
     current_kind: str
@@ -21,17 +23,16 @@ class ResolverState(TypedDict, total=False):
 
     retrieved_chunks: Annotated[list[str], operator.add]
     observations: Annotated[list[str], operator.add]
-    next_symbols: Annotated[list[str], operator.add]
     candidate_callees: Annotated[list[str], operator.add]
     visited_symbols: Annotated[list[str], operator.add]
+    visible_trace: Annotated[list[dict], operator.add]
+
+    decision: str
+    decision_reason: str
+    next_symbol: Optional[str]
 
     hop_count: int
     max_hops: int
 
-    status: Literal[
-        "running",
-        "need_jump",
-        "resolved",
-        "failed",
-    ]
+    status: Literal["running", "resolved", "failed"]
     final_answer: Optional[str]
