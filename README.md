@@ -42,3 +42,47 @@ python -m pytest -q
 ```
 
 테스트는 Step B/C만 검증합니다.
+
+## LLM_icall_resolver 사용 가이드
+
+`LLM_icall_resolver` 하위 모듈은 Tree-sitter 기반으로 C 심볼 원문(function/macro)을 추출하고, LLM 기반 간접 호출 해석 그래프를 실행하기 위한 코드입니다.
+
+- 상세 기능 설명/트러블슈팅: `LLM_icall_resolver/README.md`
+- 핵심 API: `LLM_icall_resolver.treesitter_retriever.get_symbol_source(...)`
+
+### venv-icall-resolver로 function/macro 추출 테스트
+
+```bash
+cd ~/workspace/static-profiler
+python -m venv venv-icall-resolver
+source venv-icall-resolver/bin/activate
+pip install -U pip
+pip install -r requirements.txt
+
+cd ~/workspace
+PYTHONPATH=$PWD python - <<'PY'
+from LLM_icall_resolver.treesitter_retriever import get_symbol_source
+
+print("=== function ===")
+text, kind = get_symbol_source(
+    "/home/jiwoo/workspace/glibc-src/glibc-2.41",
+    "sunrpc/key_call.c",
+    "key_call_socket",
+    488,
+    "function",
+)
+print(kind)
+print(text)
+
+print("\n=== macro ===")
+text, kind = get_symbol_source(
+    "/home/jiwoo/workspace/glibc-src/glibc-2.41",
+    "sunrpc/key_call.c",
+    "key_call_private_main",
+    390,
+    "macro",
+)
+print(kind)
+print(text)
+PY
+```
