@@ -269,20 +269,36 @@ def get_local_assignment_lines(
                 return results
     return results
 
-
 def get_context_bundle(
     project_root: str,
     relative_path: str,
     symbol: str,
     line_1_based: int,
     icall_expr: str,
+    ident_kind: str = "function",
 ) -> dict:
-    function_text, function_kind = get_function_source(
-        project_root=project_root,
-        relative_path=relative_path,
-        symbol=symbol,
-        line_1_based=line_1_based,
-    )
+    if ident_kind in {"function", "prototype", "unknown"}:
+        try:
+            primary_text, primary_kind = get_function_source(
+                project_root=project_root,
+                relative_path=relative_path,
+                symbol=symbol,
+                line_1_based=line_1_based,
+            )
+        except Exception:
+            primary_text, primary_kind = get_global_symbol_source(
+                project_root=project_root,
+                relative_path=relative_path,
+                symbol=symbol,
+                line_1_based=line_1_based,
+            )
+    else:
+        primary_text, primary_kind = get_global_symbol_source(
+            project_root=project_root,
+            relative_path=relative_path,
+            symbol=symbol,
+            line_1_based=line_1_based,
+        )
 
     callee_token = extract_call_like_identifier(icall_expr)
     field_names = extract_field_names(icall_expr)
@@ -293,18 +309,68 @@ def get_context_bundle(
 
     struct_defs = []
     for field in field_names:
-        struct_defs.extend(get_struct_definitions_for_field(project_root, field, max_results=3))
+        struct_defs.extend(
+            get_struct_definitions_for_field(project_root, field, max_results=3)
+        )
 
-    local_assignments = get_local_assignment_lines(
-        relative_path=relative_path,
-        function_text=function_text,
-        identifiers=field_names + ([callee_token] if callee_token else []),
-    )
+    local_assignments = []
+    if primary_kind == "function_definition":
+        local_assignments = get_local_assignment_lines(
+            relative_path=relative_path,
+            function_text=primary_text,
+            identifiers=field_names + ([callee_token] if callee_token else []),
+        )
 
     return {
-        "primary_block": function_text,
-        "primary_block_kind": function_kind,
+        "primary_block": primary_text,
+        "primary_block_kind": primary_kind,
         "macro_definitions": macro_defs,
         "struct_definitions": struct_defs,
         "local_assignments": local_assignments,
     }
+    
+
+
+def find_declaration_by_name_and_line(
+    root: Node,
+    source: bytes,
+    symbol: str,
+    line_1_based: int,
+) -> Optional[Node]:
+    for node in iter_nodes(root):
+        if node.type != "declaration":
+            continue
+
+        if not line_contains_node(line_1_based, node):
+            continue
+
+        text = node_text(node, source)
+
+        # symbol이 declaration 안에 실제로 들어있는지 확인
+        if re.search(rf"\b{re.escape(symbol)}\b", text):
+            return node
+
+    return None
+
+
+def get_global_symbol_source(
+    project_root: str,
+    relative_path: str,
+    symbol: str,
+    line_1_based: int,
+) -> tuple[str, str]:
+    file_path = Path(project_root) / relative_path
+    source = read_bytes_safe(file_path)
+
+    parser = build_parser()
+    tree = parser.parse(source)
+
+    decl_node = find_declaration_by_name_and_line(
+        tree.root_node, source, symbol, line_1_based
+    )
+    if decl_node is None:
+        raise ValueError(
+            f"global declaration not found: symbol={symbol}, line={line_1_based}, file={file_path}"
+        )
+
+    return node_text(decl_node, source), "global_declaration"

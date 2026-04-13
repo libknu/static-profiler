@@ -41,12 +41,12 @@ def retrieve_block(state: ResolverState) -> ResolverState:
             "observations": ["stopped because max_hops was exceeded"],
         }
 
-    if state["current_kind"] not in {"function", "unknown"}:
+    if state["current_kind"] not in {"function", "prototype", "unknown", "macro"}:
         return {
             "status": "failed",
             "final_answer": f"unsupported kind for current retriever: {state['current_kind']}",
             "observations": [
-                f"retriever currently supports only function, got {state['current_kind']}"
+                f"retriever currently supports only function/prototype/unknown/macro, got {state['current_kind']}"
             ],
         }
 
@@ -57,6 +57,7 @@ def retrieve_block(state: ResolverState) -> ResolverState:
             symbol=state["current_symbol"],
             line_1_based=state["current_line"],
             icall_expr=state["icall_expr"],
+            ident_kind=state["current_kind"],
         )
     except Exception as e:
         return {
