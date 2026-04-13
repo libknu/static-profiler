@@ -14,6 +14,7 @@ def index_symbol(state: ResolverState) -> ResolverState:
         version=state["version"],
         family=state["family"],
         symbol=symbol,
+        project_root=state["project_root"],
     )
 
     defs = ident.get("definitions", [])
@@ -40,7 +41,7 @@ def retrieve_block(state: ResolverState) -> ResolverState:
             "observations": ["stopped because max_hops was exceeded"],
         }
 
-    if state["current_kind"] != "function":
+    if state["current_kind"] not in {"function", "unknown"}:
         return {
             "status": "failed",
             "final_answer": f"unsupported kind for current retriever: {state['current_kind']}",
