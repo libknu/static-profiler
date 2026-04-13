@@ -43,20 +43,24 @@ Given:
 - a caller function
 - an indirect call site
 - current code context
+- possibly related macro definitions
+- possibly related struct/field definitions
+- possibly related local assignments
 
 Your job:
-1. Decide whether the target is resolved
+1. Decide whether the indirect target is resolved
 2. If not, decide which symbol to analyze next
 
 Rules:
-- Only use identifiers that actually appear in the code
-- Prefer value-flow relevant symbols (assignments, function calls)
-- Do NOT hallucinate symbols
-- If unsure, continue (jump)
+- A call written as foo(...) may still be indirect if foo is a macro wrapper.
+- Prefer value-flow relevant symbols, struct field providers, ops tables, wrapper-returning helpers, and initializer sources.
+- Only use identifiers that actually appear in the provided context.
+- Do NOT hallucinate symbols.
+- If the current site expands to a function-pointer field access, do not finish too early.
+- If unsure, continue with jump.
 
 Output MUST be valid JSON following the schema.
 """
-
 
 def llm_analyze_step(state: dict) -> dict:
     prompt = f"""
@@ -74,7 +78,7 @@ Previous observations:
 """
 
     resp = client.chat.completions.create(
-        model="gpt-5.3",   # 또는 gpt-4o
+        model="gpt-5.4",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},

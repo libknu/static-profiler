@@ -21,6 +21,10 @@ def build_initial_state(args) -> dict:
         "observations": [],
         "visible_trace": [],
         "candidate_callees": [],
+        "macro_context": [],
+        "struct_context": [],
+        "assignment_context": [],
+
 
         "hop_count": 0,
         "max_hops": args.max_hops,

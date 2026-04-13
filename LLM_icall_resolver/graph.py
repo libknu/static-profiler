@@ -2,7 +2,7 @@ from langgraph.graph import StateGraph, START, END
 
 from .state import ResolverState
 from .bootlin import bootlin_ident
-from .treesitter_retriever import get_symbol_source
+from .treesitter_retriever import get_context_bundle
 from .analyzer import llm_analyze_step
 
 
@@ -40,13 +40,22 @@ def retrieve_block(state: ResolverState) -> ResolverState:
             "observations": ["stopped because max_hops was exceeded"],
         }
 
+    if state["current_kind"] != "function":
+        return {
+            "status": "failed",
+            "final_answer": f"unsupported kind for current retriever: {state['current_kind']}",
+            "observations": [
+                f"retriever currently supports only function, got {state['current_kind']}"
+            ],
+        }
+
     try:
-        block_text, block_kind = get_symbol_source(
+        bundle = get_context_bundle(
             project_root=state["project_root"],
             relative_path=state["current_path"],
             symbol=state["current_symbol"],
             line_1_based=state["current_line"],
-            ident_kind=state["current_kind"],
+            icall_expr=state["icall_expr"],
         )
     except Exception as e:
         return {
@@ -55,13 +64,33 @@ def retrieve_block(state: ResolverState) -> ResolverState:
             "observations": [f"retrieval error: {e}"],
         }
 
+    chunks = [bundle["primary_block"]]
+
+    for x in bundle["macro_definitions"]:
+        chunks.append(f"[macro] {x['path']}:{x['line']}\n{x['text']}")
+    for x in bundle["struct_definitions"]:
+        chunks.append(f"[struct] {x['path']}:{x['line']}\n{x['text']}")
+    for x in bundle["local_assignments"]:
+        chunks.append(f"[assignment] {x['path']}:{x['line']}\n{x['text']}")
+
+    observations = [
+        f"retrieved {bundle['primary_block_kind']} for {state['current_symbol']} ({state['current_kind']})"
+    ]
+    if bundle["macro_definitions"]:
+        observations.append(f"found {len(bundle['macro_definitions'])} related macro definitions")
+    if bundle["struct_definitions"]:
+        observations.append(f"found {len(bundle['struct_definitions'])} related struct definitions")
+    if bundle["local_assignments"]:
+        observations.append(f"found {len(bundle['local_assignments'])} related local assignments")
+
     return {
-        "current_block": block_text,
-        "current_block_kind": block_kind,
-        "retrieved_chunks": [block_text],
-        "observations": [
-            f"retrieved {block_kind} for {state['current_symbol']} ({state['current_kind']})"
-        ],
+        "current_block": "\n\n".join(chunks),
+        "current_block_kind": "context_bundle",
+        "retrieved_chunks": chunks,
+        "macro_context": [x["text"] for x in bundle["macro_definitions"]],
+        "struct_context": [x["text"] for x in bundle["struct_definitions"]],
+        "assignment_context": [x["text"] for x in bundle["local_assignments"]],
+        "observations": observations,
         "status": "running",
     }
 

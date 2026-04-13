@@ -27,6 +27,10 @@ class ResolverState(TypedDict, total=False):
     visited_symbols: Annotated[list[str], operator.add]
     visible_trace: Annotated[list[dict], operator.add]
 
+    macro_context: Annotated[list[str], operator.add]
+    struct_context: Annotated[list[str], operator.add]
+    assignment_context: Annotated[list[str], operator.add]
+
     decision: str
     decision_reason: str
     next_symbol: Optional[str]
