@@ -58,6 +58,11 @@ Rules:
 - Do NOT hallucinate symbols.
 - If the current site expands to a function-pointer field access, do not finish too early.
 - If unsure, continue with jump.
+- Bootlin references show where the current symbol is used.
+- If the provider cannot be found locally, prefer jumping to symbols appearing in those reference locations.
+- Prefer next_symbol as a function-level provider or user site rather than a raw struct field name when possible.
+- If local value flow is insufficient, use the reference-derived jump candidates to continue analysis.
+- Avoid jumping to bare field names if a function-level reference candidate is available.
 
 Output MUST be valid JSON following the schema.
 """
@@ -69,6 +74,12 @@ Caller: {state.get("caller_symbol")}
 ICall: {state.get("icall_expr")}
 
 Visited: {state.get("visited_symbols")}
+
+Bootlin references:
+{format_bootlin_references(state.get("bootlin_references", []))}
+
+Reference-derived jump candidates:
+{format_reference_jump_candidates(state.get("reference_jump_candidates", []))}
 
 Current code:
 {state.get("current_block")}
@@ -96,3 +107,28 @@ Previous observations:
     data = json.loads(resp.choices[0].message.content)
 
     return data
+
+def format_bootlin_references(refs: list[dict]) -> str:
+    if not refs:
+        return "(none)"
+
+    lines = []
+    for r in refs:
+        path = r.get("path", "")
+        line = r.get("line", "")
+        lines.append(f"- {path}:{line}")
+    return "\n".join(lines)
+
+def format_reference_jump_candidates(cands: list[dict]) -> str:
+    if not cands:
+        return "(none)"
+
+    lines = []
+    for c in cands:
+        lines.append(
+            f"- symbol={c.get('symbol')} "
+            f"path={c.get('path')}:{c.get('line')} "
+            f"ref_line={c.get('ref_line')} "
+            f"reason={c.get('reason')}"
+        )
+    return "\n".join(lines)

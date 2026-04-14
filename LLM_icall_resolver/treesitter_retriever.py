@@ -97,6 +97,27 @@ def get_function_source(
     fn_node = find_function_definition_by_name_and_line(
         tree.root_node, source, symbol, line_1_based
     )
+
+    
+    if fn_node is None:
+        # fallback: symbol 이름만으로 다시 찾기
+        for node in iter_nodes(tree.root_node):
+            if node.type != "function_definition":
+                continue
+
+            substack = [node]
+            while substack:
+                cur = substack.pop()
+                if cur.type.endswith("_declarator"):
+                    name = extract_identifier_from_declarator(cur, source)
+                    if name == symbol:
+                        fn_node = node
+                        break
+                substack.extend(reversed(cur.children))
+
+            if fn_node:
+                break
+
     if fn_node is None:
         raise ValueError(
             f"function not found: symbol={symbol}, line={line_1_based}, file={file_path}"
@@ -374,3 +395,92 @@ def get_global_symbol_source(
         )
 
     return node_text(decl_node, source), "global_declaration"
+
+def parse_bootlin_line_field(line_field) -> list[int]:
+    if isinstance(line_field, int):
+        return [line_field]
+    if not line_field:
+        return []
+
+    out = []
+    for x in str(line_field).split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            out.append(int(x))
+        except ValueError:
+            pass
+    return out
+
+
+def find_enclosing_function_by_line(
+    root: Node,
+    source: bytes,
+    line_1_based: int,
+) -> Optional[Node]:
+    for node in iter_nodes(root):
+        if node.type != "function_definition":
+            continue
+        if line_contains_node(line_1_based, node):
+            return node
+    return None
+
+
+def get_function_name_from_definition(node: Node, source: bytes) -> Optional[str]:
+    substack = [node]
+    while substack:
+        cur = substack.pop()
+        if cur.type.endswith("_declarator"):
+            return extract_identifier_from_declarator(cur, source)
+        substack.extend(reversed(cur.children))
+    return None
+
+
+def get_reference_jump_candidates(
+    project_root: str,
+    references: list[dict],
+    max_candidates: int = 8,
+) -> list[dict]:
+    results = []
+    seen = set()
+
+    for ref in references:
+        rel_path = ref.get("path")
+        if not rel_path:
+            continue
+
+        file_path = Path(project_root) / rel_path
+        if not file_path.exists():
+            continue
+
+        source = read_bytes_safe(file_path)
+        parser = build_parser()
+        tree = parser.parse(source)
+
+        for line_no in parse_bootlin_line_field(ref.get("line")):
+            fn = find_enclosing_function_by_line(tree.root_node, source, line_no)
+            if fn is None:
+                continue
+
+            fn_name = get_function_name_from_definition(fn, source)
+            if not fn_name:
+                continue
+
+            key = (rel_path, fn_name, fn.start_point[0] + 1)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            results.append({
+                "symbol": fn_name,
+                "path": rel_path,
+                "line": fn.start_point[0] + 1,
+                "ref_line": line_no,
+                "reason": "enclosing function of Bootlin reference",
+            })
+
+            if len(results) >= max_candidates:
+                return results
+
+    return results

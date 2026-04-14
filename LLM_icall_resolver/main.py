@@ -29,6 +29,8 @@ def build_initial_state(args) -> dict:
         "hop_count": 0,
         "max_hops": args.max_hops,
         "status": "running",
+
+        "bootlin_references": [],
     }
 
 

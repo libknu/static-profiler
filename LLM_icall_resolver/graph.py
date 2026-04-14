@@ -2,7 +2,7 @@ from langgraph.graph import StateGraph, START, END
 
 from .state import ResolverState
 from .bootlin import bootlin_ident
-from .treesitter_retriever import get_context_bundle
+from .treesitter_retriever import get_context_bundle, get_reference_jump_candidates
 from .analyzer import llm_analyze_step
 
 
@@ -18,6 +18,8 @@ def index_symbol(state: ResolverState) -> ResolverState:
     )
 
     defs = ident.get("definitions", [])
+    refs = ident.get("references", [])   # 추가
+
     if not defs:
         return {
             "status": "failed",
@@ -30,7 +32,13 @@ def index_symbol(state: ResolverState) -> ResolverState:
         "current_path": d["path"],
         "current_line": int(d["line"]),
         "current_kind": d["type"],
-        "observations": [f"{symbol} defined at {d['path']}:{d['line']} ({d['type']})"],
+
+        "bootlin_references": refs,   # 추가
+
+        "observations": [
+            f"{symbol} defined at {d['path']}:{d['line']} ({d['type']})",
+            f"bootlin references: {len(refs)}",   # 추가
+        ],
     }
 
 def retrieve_block(state: ResolverState) -> ResolverState:
@@ -94,6 +102,37 @@ def retrieve_block(state: ResolverState) -> ResolverState:
         "assignment_context": [x["text"] for x in bundle["local_assignments"]],
         "observations": observations,
         "status": "running",
+    }
+
+def expand_reference_candidates(state: ResolverState) -> ResolverState:
+    refs = state.get("bootlin_references", [])
+    if not refs:
+        return {
+            "reference_jump_candidates": [],
+            "observations": ["no bootlin references to expand"],
+        }
+
+    try:
+        candidates = get_reference_jump_candidates(
+            project_root=state["project_root"],
+            references=refs,
+        )
+    except Exception as e:
+        return {
+            "reference_jump_candidates": [],
+            "observations": [f"reference expansion failed: {e}"],
+        }
+
+    obs = [f"expanded {len(candidates)} reference-based jump candidates"]
+    for c in candidates:
+        obs.append(
+            f"reference candidate: {c['symbol']} at {c['path']}:{c['line']} "
+            f"(from ref line {c['ref_line']})"
+        )
+
+    return {
+        "reference_jump_candidates": candidates,
+        "observations": obs,
     }
 
 
@@ -238,6 +277,7 @@ def build_graph():
     graph = StateGraph(ResolverState)
 
     graph.add_node("index_symbol", index_symbol)
+    graph.add_node("expand_reference_candidates", expand_reference_candidates)
     graph.add_node("retrieve_block", retrieve_block)
     graph.add_node("analyze_with_llm", analyze_with_llm)
     graph.add_node("jump_symbol", jump_symbol)
@@ -246,6 +286,7 @@ def build_graph():
 
     graph.add_edge(START, "index_symbol")
     graph.add_edge("index_symbol", "retrieve_block")
+    graph.add_edge("expand_reference_candidates", "retrieve_block")
 
     graph.add_conditional_edges(
         "retrieve_block",

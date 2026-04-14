@@ -40,3 +40,6 @@ class ResolverState(TypedDict, total=False):
 
     status: Literal["running", "resolved", "failed"]
     final_answer: Optional[str]
+
+    bootlin_references: list[dict]
+    reference_jump_candidates: Annotated[list[dict], operator.add]
