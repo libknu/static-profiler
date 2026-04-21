@@ -30,12 +30,14 @@ class ResolverState(TypedDict, total=False):
     macro_context: Annotated[list[str], operator.add]
     struct_context: Annotated[list[str], operator.add]
     assignment_context: Annotated[list[str], operator.add]
+    initializer_context: Annotated[list[str], operator.add]
 
     decision: str
     decision_reason: str
     next_symbol: Optional[str]
 
     hop_count: int
+    iteration: int
     max_hops: int
 
     status: Literal["running", "resolved", "failed"]
@@ -43,3 +45,7 @@ class ResolverState(TypedDict, total=False):
 
     bootlin_references: list[dict]
     reference_jump_candidates: Annotated[list[dict], operator.add]
+
+    run_name: str
+    output_root: str
+    output_dir: str

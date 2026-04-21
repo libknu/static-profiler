@@ -177,7 +177,6 @@ def _search_local_symbol(project_root: str, symbol: str, max_results: int = 20) 
         "source": "local_fallback" if results else "none",
     }
 
-
 def bootlin_ident(
     project: str,
     version: str,
@@ -198,19 +197,27 @@ def bootlin_ident(
     remote_defs = remote.get("definitions", []) or []
     remote_refs = remote.get("references", []) or []
 
+    # 1) remote에 definition이 있으면 local fallback을 섞지 않음
+    if remote_defs:
+        return {
+            "definitions": _sort_definitions(_dedup_definitions(remote_defs)),
+            "references": remote_refs,
+            "documentations": remote.get("documentations", []),
+            "source": "bootlin",
+        }
+
+    # 2) remote definition이 없을 때만 local fallback 사용
     local_defs: list[dict] = []
     if project_root:
         local = _search_local_symbol(project_root, symbol)
         local_defs = local.get("definitions", []) or []
 
-    merged_defs = _sort_definitions(_dedup_definitions(remote_defs + local_defs))
-
-    if merged_defs or remote_refs:
+    if local_defs or remote_refs:
         return {
-            "definitions": merged_defs,
+            "definitions": _sort_definitions(_dedup_definitions(local_defs)),
             "references": remote_refs,
             "documentations": remote.get("documentations", []),
-            "source": "bootlin+local" if local_defs else "bootlin",
+            "source": "local_fallback" if local_defs else "bootlin_refs_only",
         }
 
     remote["source"] = "bootlin_empty"

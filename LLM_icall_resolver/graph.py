@@ -1,9 +1,63 @@
+import re
+
 from langgraph.graph import StateGraph, START, END
 
 from .state import ResolverState
 from .bootlin import bootlin_ident
-from .treesitter_retriever import get_context_bundle, get_reference_jump_candidates
+from .treesitter_retriever import (
+    get_context_bundle,
+    get_reference_jump_candidates,
+)
 from .analyzer import llm_analyze_step
+from .trace_store import save_step_artifacts
+
+
+IDENT_PAT = re.compile(r"\b[A-Za-z_]\w*\b")
+
+
+def _extract_symbols(text: str) -> set[str]:
+    return set(IDENT_PAT.findall(text or ""))
+
+
+def _extract_symbols_from_context_list(items: list[str]) -> set[str]:
+    out = set()
+    for item in items or []:
+        out.update(_extract_symbols(item))
+    return out
+
+
+def classify_jump_kind(state: ResolverState, next_symbol: str | None) -> tuple[str | None, list[str]]:
+    if not next_symbol:
+        return None, []
+
+    matched_sources = []
+
+    if next_symbol in _extract_symbols(state.get("current_block", "")):
+        matched_sources.append("current_block")
+
+    if next_symbol in _extract_symbols_from_context_list(state.get("macro_context", [])):
+        matched_sources.append("macro_context")
+
+    if next_symbol in _extract_symbols_from_context_list(state.get("struct_context", [])):
+        matched_sources.append("struct_context")
+
+    if next_symbol in _extract_symbols_from_context_list(state.get("assignment_context", [])):
+        matched_sources.append("assignment_context")
+
+    if next_symbol in _extract_symbols_from_context_list(state.get("initializer_context", [])):
+        matched_sources.append("initializer_context")
+
+    ref_syms = {
+        c.get("symbol")
+        for c in state.get("reference_jump_candidates", [])
+        if c.get("symbol")
+    }
+    if next_symbol in ref_syms:
+        matched_sources.append("reference_jump_candidates")
+
+    if matched_sources:
+        return "grounded", matched_sources
+    return "speculative", []
 
 
 def index_symbol(state: ResolverState) -> ResolverState:
@@ -18,7 +72,7 @@ def index_symbol(state: ResolverState) -> ResolverState:
     )
 
     defs = ident.get("definitions", [])
-    refs = ident.get("references", [])   # 추가
+    refs = ident.get("references", [])
 
     if not defs:
         return {
@@ -32,14 +86,13 @@ def index_symbol(state: ResolverState) -> ResolverState:
         "current_path": d["path"],
         "current_line": int(d["line"]),
         "current_kind": d["type"],
-
-        "bootlin_references": refs,   # 추가
-
+        "bootlin_references": refs,
         "observations": [
             f"{symbol} defined at {d['path']}:{d['line']} ({d['type']})",
-            f"bootlin references: {len(refs)}",   # 추가
+            f"bootlin references: {len(refs)}",
         ],
     }
+
 
 def retrieve_block(state: ResolverState) -> ResolverState:
     if state.get("hop_count", 0) > state.get("max_hops", 6):
@@ -49,7 +102,7 @@ def retrieve_block(state: ResolverState) -> ResolverState:
             "observations": ["stopped because max_hops was exceeded"],
         }
 
-    if state["current_kind"] not in {"function", "prototype", "unknown", "macro"}:
+    if state["current_kind"] not in {"function", "prototype", "unknown", "macro", "variable", "struct"}:
         return {
             "status": "failed",
             "final_answer": f"unsupported kind for current retriever: {state['current_kind']}",
@@ -82,6 +135,8 @@ def retrieve_block(state: ResolverState) -> ResolverState:
         chunks.append(f"[struct] {x['path']}:{x['line']}\n{x['text']}")
     for x in bundle["local_assignments"]:
         chunks.append(f"[assignment] {x['path']}:{x['line']}\n{x['text']}")
+    for x in bundle["initializer_definitions"]:
+        chunks.append(f"[initializer] {x['path']}:{x['line']}\n{x['text']}")
 
     observations = [
         f"retrieved {bundle['primary_block_kind']} for {state['current_symbol']} ({state['current_kind']})"
@@ -92,6 +147,8 @@ def retrieve_block(state: ResolverState) -> ResolverState:
         observations.append(f"found {len(bundle['struct_definitions'])} related struct definitions")
     if bundle["local_assignments"]:
         observations.append(f"found {len(bundle['local_assignments'])} related local assignments")
+    if bundle["initializer_definitions"]:
+        observations.append(f"found {len(bundle['initializer_definitions'])} related initializer snippets")
 
     return {
         "current_block": "\n\n".join(chunks),
@@ -100,9 +157,11 @@ def retrieve_block(state: ResolverState) -> ResolverState:
         "macro_context": [x["text"] for x in bundle["macro_definitions"]],
         "struct_context": [x["text"] for x in bundle["struct_definitions"]],
         "assignment_context": [x["text"] for x in bundle["local_assignments"]],
+        "initializer_context": [x["text"] for x in bundle["initializer_definitions"]],
         "observations": observations,
         "status": "running",
     }
+
 
 def expand_reference_candidates(state: ResolverState) -> ResolverState:
     refs = state.get("bootlin_references", [])
@@ -137,9 +196,17 @@ def expand_reference_candidates(state: ResolverState) -> ResolverState:
 
 
 def analyze_with_llm(state: ResolverState) -> ResolverState:
-    result = llm_analyze_step(state)
+    bundle = llm_analyze_step(state)
+    result = bundle["llm_output"]
+
+    iteration = state.get("iteration", 0) + 1
+    jump_kind, grounded_sources = classify_jump_kind(state, result.get("next_symbol"))
+    selected_from_reference_candidates = result.get("next_symbol") in {
+        c.get("symbol") for c in state.get("reference_jump_candidates", []) if c.get("symbol")
+    }
 
     trace_item = {
+        "iteration": iteration,
         "step": state.get("hop_count", 0),
         "focus_symbol": state.get("current_symbol"),
         "decision": result["decision"],
@@ -148,9 +215,38 @@ def analyze_with_llm(state: ResolverState) -> ResolverState:
         "evidence": result["evidence"],
         "candidate_callees": result["candidate_callees"],
         "resolved": result["resolved"],
+        "jump_kind": jump_kind,
+        "grounded_sources": grounded_sources,
+        "selected_from_reference_candidates": selected_from_reference_candidates,
     }
 
+    save_step_artifacts(
+        output_dir=state["output_dir"],
+        iteration=iteration,
+        prompt_payload=bundle["prompt_payload"],
+        prompt_text=bundle["prompt_text"],
+        response_payload={
+            "iteration": iteration,
+            "model": bundle["model"],
+            "llm_output": result,
+            "jump_kind": jump_kind,
+            "grounded_sources": grounded_sources,
+            "selected_from_reference_candidates": selected_from_reference_candidates,
+            "state_snapshot": {
+                "current_symbol": state.get("current_symbol"),
+                "caller_symbol": state.get("caller_symbol"),
+                "icall_expr": state.get("icall_expr"),
+                "current_path": state.get("current_path"),
+                "current_line": state.get("current_line"),
+                "current_kind": state.get("current_kind"),
+                "visited_symbols": state.get("visited_symbols", []),
+                "reference_jump_candidates": state.get("reference_jump_candidates", []),
+            },
+        },
+    )
+
     return {
+        "iteration": iteration,
         "decision": result["decision"],
         "decision_reason": result["analysis_summary"],
         "next_symbol": result["next_symbol"],
@@ -203,6 +299,7 @@ def finish(state: ResolverState) -> ResolverState:
     lines = []
     lines.append(f"ICall expression: {state.get('icall_expr', '')}")
     lines.append(f"Caller symbol: {state.get('caller_symbol', '')}")
+    lines.append(f"Iterations: {state.get('iteration', 0)}")
     lines.append(f"Visited path: {' -> '.join(visited)}")
 
     if candidates:
@@ -216,10 +313,13 @@ def finish(state: ResolverState) -> ResolverState:
     lines.append("Trace:")
     for item in traces:
         lines.append(
-            f"- step={item['step']} symbol={item['focus_symbol']} "
-            f"decision={item['decision']} next={item['next_symbol']}"
+            f"- iteration={item['iteration']} step={item['step']} "
+            f"symbol={item['focus_symbol']} decision={item['decision']} "
+            f"next={item['next_symbol']} jump_kind={item.get('jump_kind')}"
         )
         lines.append(f"  summary: {item['summary']}")
+        if item.get("grounded_sources"):
+            lines.append(f"  grounded_sources: {item['grounded_sources']}")
         if item.get("evidence"):
             for ev in item["evidence"]:
                 lines.append(f"  evidence: {ev}")
@@ -233,16 +333,18 @@ def finish(state: ResolverState) -> ResolverState:
 def fail(state: ResolverState) -> ResolverState:
     traces = state.get("visible_trace", [])
     lines = []
-    lines.append(f"Resolver failed.")
+    lines.append("Resolver failed.")
     lines.append(f"Reason: {state.get('final_answer', 'unknown failure')}")
+    lines.append(f"Iterations: {state.get('iteration', 0)}")
     lines.append(f"Visited path: {' -> '.join(state.get('visited_symbols', []))}")
     if traces:
         lines.append("")
         lines.append("Trace:")
         for item in traces:
             lines.append(
-                f"- step={item['step']} symbol={item['focus_symbol']} "
-                f"decision={item['decision']} next={item['next_symbol']}"
+                f"- iteration={item['iteration']} step={item['step']} "
+                f"symbol={item['focus_symbol']} decision={item['decision']} "
+                f"next={item['next_symbol']} jump_kind={item.get('jump_kind')}"
             )
             lines.append(f"  summary: {item['summary']}")
     return {
@@ -254,7 +356,7 @@ def fail(state: ResolverState) -> ResolverState:
 def route_after_retrieve(state: ResolverState):
     if state.get("status") == "failed":
         return "fail"
-    return "analyze_with_llm"
+    return "expand_reference_candidates"
 
 
 def route_after_llm(state: ResolverState):
@@ -277,8 +379,8 @@ def build_graph():
     graph = StateGraph(ResolverState)
 
     graph.add_node("index_symbol", index_symbol)
-    graph.add_node("expand_reference_candidates", expand_reference_candidates)
     graph.add_node("retrieve_block", retrieve_block)
+    graph.add_node("expand_reference_candidates", expand_reference_candidates)
     graph.add_node("analyze_with_llm", analyze_with_llm)
     graph.add_node("jump_symbol", jump_symbol)
     graph.add_node("finish", finish)
@@ -286,16 +388,17 @@ def build_graph():
 
     graph.add_edge(START, "index_symbol")
     graph.add_edge("index_symbol", "retrieve_block")
-    graph.add_edge("expand_reference_candidates", "retrieve_block")
 
     graph.add_conditional_edges(
         "retrieve_block",
         route_after_retrieve,
         {
-            "analyze_with_llm": "analyze_with_llm",
+            "expand_reference_candidates": "expand_reference_candidates",
             "fail": "fail",
         },
     )
+
+    graph.add_edge("expand_reference_candidates", "analyze_with_llm")
 
     graph.add_conditional_edges(
         "analyze_with_llm",

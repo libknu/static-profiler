@@ -125,12 +125,20 @@ def get_function_source(
 
     return node_text(fn_node, source), "function_definition"
 
-
 def extract_call_like_identifier(icall_expr: str) -> Optional[str]:
-    m = re.match(r"\s*([A-Za-z_]\w*)\s*\(", icall_expr)
-    if not m:
+    matches = re.findall(r"([A-Za-z_]\w*)\s*\(", icall_expr)
+    if not matches:
         return None
-    return m.group(1)
+    
+    blacklist = {
+        "if", "while", "for", "switch", "return", "sizeof"
+    }
+    
+    for name in reversed(matches):
+        if name not in blacklist:
+            return name
+    
+    return None
 
 
 def extract_field_names(expr: str) -> list[str]:
@@ -290,6 +298,47 @@ def get_local_assignment_lines(
                 return results
     return results
 
+
+def get_macro_source(
+    project_root: str,
+    macro_name: str,
+    relative_path: Optional[str] = None,
+    line_1_based: Optional[int] = None,
+) -> tuple[str, str]:
+    candidates: list[Path] = []
+
+    if relative_path is not None:
+        file_path = Path(project_root) / relative_path
+        if file_path.exists():
+            candidates.append(file_path)
+
+    for path in collect_c_family_files(project_root):
+        if path not in candidates:
+            candidates.append(path)
+
+    define_pat = re.compile(rf"^\s*#\s*define\s+{re.escape(macro_name)}\b")
+
+    for path in candidates:
+        lines = read_text_safe(path).splitlines()
+        i = 0
+        while i < len(lines):
+            if define_pat.search(lines[i]):
+                chunk = [lines[i]]
+                j = i + 1
+                while chunk[-1].rstrip().endswith("\\") and j < len(lines):
+                    chunk.append(lines[j])
+                    j += 1
+
+                return "\n".join(chunk), "macro_definition"
+            i += 1
+
+    raise ValueError(
+        f"macro not found: symbol={macro_name}, line={line_1_based}, file={relative_path}"
+    )
+
+
+
+
 def get_context_bundle(
     project_root: str,
     relative_path: str,
@@ -298,7 +347,14 @@ def get_context_bundle(
     icall_expr: str,
     ident_kind: str = "function",
 ) -> dict:
-    if ident_kind in {"function", "prototype", "unknown"}:
+    if ident_kind == "macro":
+        primary_text, primary_kind = get_macro_source(
+                project_root=project_root,
+                macro_name=symbol,
+                relative_path=relative_path,
+                line_1_based=line_1_based,
+                )
+    elif ident_kind in {"function", "prototype", "unknown"}:
         try:
             primary_text, primary_kind = get_function_source(
                 project_root=project_root,
@@ -342,14 +398,20 @@ def get_context_bundle(
             identifiers=field_names + ([callee_token] if callee_token else []),
         )
 
+    initializer_defs = get_initializer_occurrences(
+        project_root=project_root,
+        identifiers=field_names + ([callee_token] if callee_token else []),
+        max_results=10,
+    )
+
     return {
         "primary_block": primary_text,
         "primary_block_kind": primary_kind,
         "macro_definitions": macro_defs,
         "struct_definitions": struct_defs,
         "local_assignments": local_assignments,
+        "initializer_definitions": initializer_defs,
     }
-    
 
 
 def find_declaration_by_name_and_line(
@@ -481,6 +543,45 @@ def get_reference_jump_candidates(
             })
 
             if len(results) >= max_candidates:
+                return results
+
+    return results
+
+def get_initializer_occurrences(
+    project_root: str,
+    identifiers: list[str],
+    max_results: int = 10,
+) -> list[dict]:
+    results: list[dict] = []
+    identifiers = [x for x in identifiers if x]
+    if not identifiers:
+        return results
+
+    for path in collect_c_family_files(project_root):
+        source = read_bytes_safe(path)
+        parser = build_parser()
+        tree = parser.parse(source)
+
+        for node in iter_nodes(tree.root_node):
+            if node.type not in {"declaration", "init_declarator"}:
+                continue
+
+            text = node_text(node, source)
+            if "=" not in text:
+                continue
+
+            if not any(re.search(rf"\b{re.escape(ident)}\b", text) for ident in identifiers):
+                continue
+
+            results.append(
+                {
+                    "kind": "initializer_occurrence",
+                    "path": str(path.relative_to(project_root)),
+                    "line": node.start_point[0] + 1,
+                    "text": text,
+                }
+            )
+            if len(results) >= max_results:
                 return results
 
     return results
