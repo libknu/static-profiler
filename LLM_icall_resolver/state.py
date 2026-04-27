@@ -4,7 +4,7 @@ import operator
 
 
 class ResolverState(TypedDict, total=False):
-    project_root: str
+    project_root: str #initial input
     project: str
     version: str
     family: str
@@ -13,24 +13,26 @@ class ResolverState(TypedDict, total=False):
     icall_expr: str
     icall_location: str
 
-    current_symbol: str
+    current_symbol: str #index symbol
     current_path: str
     current_line: int
     current_kind: str
-
     current_block: str
     current_block_kind: str
 
-    retrieved_chunks: Annotated[list[str], operator.add]
+    macro_context: Annotated[list[str], operator.add]  #retrive block
+    struct_context: Annotated[list[str], operator.add]
+    assignment_context: Annotated[list[str], operator.add]
+    initializer_context: Annotated[list[str], operator.add]
+
+    bootlin_references: list[dict] #expand references
+    reference_jump_candidates: Annotated[list[dict], operator.add]
+
+    retrieved_chunks: Annotated[list[str], operator.add] #analyze with LLM
     observations: Annotated[list[str], operator.add]
     candidate_callees: Annotated[list[str], operator.add]
     visited_symbols: Annotated[list[str], operator.add]
     visible_trace: Annotated[list[dict], operator.add]
-
-    macro_context: Annotated[list[str], operator.add]
-    struct_context: Annotated[list[str], operator.add]
-    assignment_context: Annotated[list[str], operator.add]
-    initializer_context: Annotated[list[str], operator.add]
 
     decision: str
     decision_reason: str
@@ -42,9 +44,6 @@ class ResolverState(TypedDict, total=False):
 
     status: Literal["running", "resolved", "failed"]
     final_answer: Optional[str]
-
-    bootlin_references: list[dict]
-    reference_jump_candidates: Annotated[list[dict], operator.add]
 
     run_name: str
     output_root: str
