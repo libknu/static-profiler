@@ -80,5 +80,47 @@ def save_step_artifacts(
     write_json(response_path, response_payload)
 
 
+def order_final_result(result: dict) -> dict:
+    preferred_order = [
+        "project_root",
+        "project",
+        "version",
+        "family",
+        "model",
+        "caller_symbol",
+        "icall_expr",
+        "icall_location",
+        "status",
+        "icall_resolution_status",
+        "icall_resolved",
+        "icall_resolution_reason",
+        "icall_targets",
+        "candidate_callees",
+    ]
+
+    ordered = {}
+    for key in preferred_order:
+        if key in result:
+            ordered[key] = result[key]
+    for key, value in result.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
+
+
 def save_final_result(output_dir: str, result: dict) -> None:
-    write_json(Path(output_dir) / "final.json", result)
+    output_dir = Path(output_dir)
+    write_json(output_dir / "final.json", order_final_result(result))
+
+    resolution_status = result.get("icall_resolution_status", "failed")
+    (output_dir / f"status.{resolution_status}").write_text(
+        resolution_status + "\n",
+        encoding="utf-8",
+    )
+
+    if result.get("icall_resolved"):
+        candidates = result.get("icall_targets") or result.get("candidate_callees", [])
+        (output_dir / "candidates.list").write_text(
+            "\n".join(str(candidate) for candidate in candidates) + "\n",
+            encoding="utf-8",
+        )

@@ -1,6 +1,10 @@
 import re
 
-from langgraph.graph import StateGraph, START, END
+try:
+    from langgraph.graph import StateGraph, START, END
+except ModuleNotFoundError:
+    StateGraph = None
+    START = END = None
 
 from .state import ResolverState
 from .bootlin import bootlin_ident
@@ -58,6 +62,26 @@ def classify_jump_kind(state: ResolverState, next_symbol: str | None) -> tuple[s
     if matched_sources:
         return "grounded", matched_sources
     return "speculative", []
+
+
+def summarize_icall_resolution(candidates: list[str], decision_reason: str) -> str:
+    if candidates:
+        return f"Resolved indirect-call target(s): {', '.join(candidates)}"
+
+    reason = (decision_reason or "").lower()
+    if "not an indirect call" in reason or "not a call" in reason:
+        return "The analyzed expression is not an indirect call."
+    return "No candidate callees were identified."
+
+
+def classify_icall_resolution(candidates: list[str], decision_reason: str) -> str:
+    if candidates:
+        return "resolved"
+
+    reason = (decision_reason or "").lower()
+    if "not an indirect call" in reason or "not a call" in reason:
+        return "not_icall"
+    return "unresolved"
 
 
 def index_symbol(state: ResolverState) -> ResolverState:
@@ -200,6 +224,16 @@ def analyze_with_llm(state: ResolverState) -> ResolverState:
     result = bundle["llm_output"]
 
     iteration = state.get("iteration", 0) + 1
+    icall_targets = list(dict.fromkeys(result["candidate_callees"]))
+    icall_resolved = bool(icall_targets)
+    icall_resolution_reason = summarize_icall_resolution(
+        icall_targets,
+        result["analysis_summary"],
+    )
+    icall_resolution_status = classify_icall_resolution(
+        icall_targets,
+        result["analysis_summary"],
+    )
     jump_kind, grounded_sources = classify_jump_kind(state, result.get("next_symbol"))
     selected_from_reference_candidates = result.get("next_symbol") in {
         c.get("symbol") for c in state.get("reference_jump_candidates", []) if c.get("symbol")
@@ -228,6 +262,10 @@ def analyze_with_llm(state: ResolverState) -> ResolverState:
         response_payload={
             "iteration": iteration,
             "model": bundle["model"],
+            "icall_resolved": icall_resolved,
+            "icall_resolution_status": icall_resolution_status,
+            "icall_resolution_reason": icall_resolution_reason,
+            "icall_targets": icall_targets,
             "llm_output": result,
             "jump_kind": jump_kind,
             "grounded_sources": grounded_sources,
@@ -251,6 +289,10 @@ def analyze_with_llm(state: ResolverState) -> ResolverState:
         "decision_reason": result["analysis_summary"],
         "next_symbol": result["next_symbol"],
         "candidate_callees": result["candidate_callees"],
+        "icall_resolution_status": icall_resolution_status,
+        "icall_resolved": icall_resolved,
+        "icall_resolution_reason": icall_resolution_reason,
+        "icall_targets": icall_targets,
         "observations": result["evidence"],
         "visible_trace": [trace_item],
         "status": "resolved" if result["decision"] == "finish" else "running",
@@ -294,11 +336,23 @@ def jump_symbol(state: ResolverState) -> ResolverState:
 def finish(state: ResolverState) -> ResolverState:
     visited = state.get("visited_symbols", [])
     traces = state.get("visible_trace", [])
-    candidates = state.get("candidate_callees", [])
+    candidates = list(dict.fromkeys(state.get("candidate_callees", [])))
+    icall_resolved = bool(candidates)
+    icall_resolution_reason = summarize_icall_resolution(
+        candidates,
+        state.get("decision_reason", ""),
+    )
+    icall_resolution_status = classify_icall_resolution(
+        candidates,
+        state.get("decision_reason", ""),
+    )
 
     lines = []
     lines.append(f"ICall expression: {state.get('icall_expr', '')}")
     lines.append(f"Caller symbol: {state.get('caller_symbol', '')}")
+    lines.append(f"ICall resolution status: {icall_resolution_status}")
+    lines.append(f"ICall resolved: {icall_resolved}")
+    lines.append(f"ICall resolution reason: {icall_resolution_reason}")
     lines.append(f"Iterations: {state.get('iteration', 0)}")
     lines.append(f"Visited path: {' -> '.join(visited)}")
 
@@ -326,6 +380,10 @@ def finish(state: ResolverState) -> ResolverState:
 
     return {
         "status": "resolved",
+        "icall_resolution_status": icall_resolution_status,
+        "icall_resolved": icall_resolved,
+        "icall_resolution_reason": icall_resolution_reason,
+        "icall_targets": candidates,
         "final_answer": "\n".join(lines),
     }
 
@@ -349,6 +407,10 @@ def fail(state: ResolverState) -> ResolverState:
             lines.append(f"  summary: {item['summary']}")
     return {
         "status": "failed",
+        "icall_resolution_status": "failed",
+        "icall_resolved": False,
+        "icall_resolution_reason": state.get("final_answer", "resolver failed"),
+        "icall_targets": [],
         "final_answer": "\n".join(lines),
     }
 
@@ -376,6 +438,9 @@ def route_after_jump(state: ResolverState):
 
 
 def build_graph():
+    if StateGraph is None:
+        raise RuntimeError("langgraph package is required for build_graph")
+
     graph = StateGraph(ResolverState)
 
     graph.add_node("index_symbol", index_symbol)

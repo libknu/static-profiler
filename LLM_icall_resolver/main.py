@@ -4,6 +4,7 @@ import os
 import re
 
 from .graph import build_graph
+from .analyzer import DEFAULT_MODEL_NAME
 from .trace_store import prepare_output_dir, save_final_result, save_run_manifest
 
 
@@ -30,6 +31,7 @@ def build_initial_state(args, run_name: str, output_dir: str) -> dict:
         "project": args.project,
         "version": args.version,
         "family": args.family,
+        "model": args.model,
 
         "caller_symbol": args.caller_symbol,
         "current_symbol": args.caller_symbol,
@@ -50,6 +52,10 @@ def build_initial_state(args, run_name: str, output_dir: str) -> dict:
         "iteration": 0,
         "max_hops": args.max_hops,
         "status": "running",
+        "icall_resolution_status": "unresolved",
+        "icall_resolved": False,
+        "icall_resolution_reason": "",
+        "icall_targets": [],
 
         "bootlin_references": [],
         "reference_jump_candidates": [],
@@ -62,6 +68,12 @@ def build_initial_state(args, run_name: str, output_dir: str) -> dict:
 
 def print_result(result: dict) -> None:
     print("STATUS:", result.get("status", "unknown"))
+    print("ICALL_RESOLUTION_STATUS:", result.get("icall_resolution_status", "unknown"))
+    print("ICALL_RESOLVED:", result.get("icall_resolved", False))
+    if result.get("icall_resolution_reason"):
+        print("ICALL_REASON:", result["icall_resolution_reason"])
+    if result.get("icall_targets"):
+        print("ICALL_TARGETS:", result["icall_targets"])
     print()
 
     print("OBSERVATIONS:")
@@ -107,6 +119,7 @@ def main():
     parser.add_argument("--project", default="glibc")
     parser.add_argument("--version", default="glibc-2.41")
     parser.add_argument("--family", default="C")
+    parser.add_argument("--model", default=os.environ.get("LLM_ICALL_MODEL", DEFAULT_MODEL_NAME))
 
     parser.add_argument("--caller-symbol", default="key_call_socket")
     parser.add_argument("--icall-expr", default="clnt_call(clnt, proc, xdr_arg, arg, xdr_rslt, rslt, wait_time)")

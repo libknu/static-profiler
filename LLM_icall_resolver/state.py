@@ -1,5 +1,4 @@
-from typing import Annotated, Literal, Optional
-from typing_extensions import TypedDict
+from typing import Annotated, Literal, Optional, TypedDict
 import operator
 
 
@@ -8,6 +7,7 @@ class ResolverState(TypedDict, total=False):
     project: str
     version: str
     family: str
+    model: str
 
     caller_symbol: str
     icall_expr: str
@@ -43,6 +43,10 @@ class ResolverState(TypedDict, total=False):
     max_hops: int
 
     status: Literal["running", "resolved", "failed"]
+    icall_resolution_status: Literal["resolved", "unresolved", "not_icall", "failed"]
+    icall_resolved: bool
+    icall_resolution_reason: str
+    icall_targets: list[str]
     final_answer: Optional[str]
 
     run_name: str

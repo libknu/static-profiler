@@ -1,9 +1,12 @@
 import os
 import json
-from openai import OpenAI
+try:
+    from openai import OpenAI
+except ModuleNotFoundError:
+    OpenAI = None
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-MODEL_NAME = "gpt-5.4"
+DEFAULT_MODEL_NAME = "gpt-5.4"
+MODEL_NAME = DEFAULT_MODEL_NAME
 
 JSON_SCHEMA = {
     "type": "object",
@@ -154,11 +157,16 @@ Previous observations:
 
 
 def llm_analyze_step(state: dict) -> dict:
+    if OpenAI is None:
+        raise RuntimeError("openai package is required for llm_analyze_step")
+
     prompt_payload = build_step_prompt_payload(state)
     prompt_text = render_step_prompt(prompt_payload)
+    model = state.get("model") or DEFAULT_MODEL_NAME
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
     resp = client.chat.completions.create(
-        model=MODEL_NAME,
+        model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt_text},
@@ -176,7 +184,7 @@ def llm_analyze_step(state: dict) -> dict:
     data = json.loads(resp.choices[0].message.content)
 
     return {
-        "model": MODEL_NAME,
+        "model": model,
         "prompt_payload": prompt_payload,
         "prompt_text": prompt_text,
         "llm_output": data,
