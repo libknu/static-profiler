@@ -84,6 +84,26 @@ def classify_icall_resolution(candidates: list[str], decision_reason: str) -> st
     return "unresolved"
 
 
+def select_definition(defs: list[dict], icall_location: str | None) -> dict:
+    if not defs:
+        raise ValueError("select_definition requires at least one definition")
+
+    if not icall_location:
+        return defs[0]
+
+    for d in defs:
+        if d.get("path") == icall_location:
+            return d
+
+    icall_dir = icall_location.rsplit("/", 1)[0] if "/" in icall_location else ""
+    if icall_dir:
+        for d in defs:
+            if str(d.get("path", "")).startswith(icall_dir + "/"):
+                return d
+
+    return defs[0]
+
+
 def index_symbol(state: ResolverState) -> ResolverState:
     symbol = state["current_symbol"]
 
@@ -105,7 +125,7 @@ def index_symbol(state: ResolverState) -> ResolverState:
             "observations": [f"Bootlin ident lookup failed for {symbol}"],
         }
 
-    d = defs[0]
+    d = select_definition(defs, state.get("icall_location"))
     return {
         "current_path": d["path"],
         "current_line": int(d["line"]),
@@ -126,12 +146,22 @@ def retrieve_block(state: ResolverState) -> ResolverState:
             "observations": ["stopped because max_hops was exceeded"],
         }
 
-    if state["current_kind"] not in {"function", "prototype", "unknown", "macro", "variable", "struct"}:
+    if state["current_kind"] not in {
+        "function",
+        "prototype",
+        "unknown",
+        "macro",
+        "variable",
+        "struct",
+        "typedef",
+        "member",
+        "externvar",
+    }:
         return {
             "status": "failed",
             "final_answer": f"unsupported kind for current retriever: {state['current_kind']}",
             "observations": [
-                f"retriever currently supports only function/prototype/unknown/macro, got {state['current_kind']}"
+                f"retriever does not support current kind: {state['current_kind']}"
             ],
         }
 
@@ -277,6 +307,7 @@ def analyze_with_llm(state: ResolverState) -> ResolverState:
                 "current_path": state.get("current_path"),
                 "current_line": state.get("current_line"),
                 "current_kind": state.get("current_kind"),
+                "hop_count": state.get("hop_count", 0),
                 "visited_symbols": state.get("visited_symbols", []),
                 "reference_jump_candidates": state.get("reference_jump_candidates", []),
             },
@@ -312,9 +343,15 @@ def jump_symbol(state: ResolverState) -> ResolverState:
     visited = state.get("visited_symbols", [])
     if next_sym in visited:
         return {
-            "status": "failed",
-            "final_answer": f"loop detected: {next_sym}",
-            "observations": [f"refusing to revisit already visited symbol {next_sym}"],
+            "status": "resolved",
+            "decision": "finish",
+            "decision_reason": (
+                f"Loop detected at {next_sym}. The resolver reached a previously "
+                "visited symbol without new value-flow evidence, so this path is "
+                "classified as unresolved instead of failed."
+            ),
+            "next_symbol": None,
+            "observations": [f"stopped before revisiting already visited symbol {next_sym}"],
         }
 
     if state.get("hop_count", 0) >= state.get("max_hops", 6):
@@ -434,6 +471,8 @@ def route_after_llm(state: ResolverState):
 def route_after_jump(state: ResolverState):
     if state.get("status") == "failed":
         return "fail"
+    if state.get("status") == "resolved":
+        return "finish"
     return "index_symbol"
 
 
@@ -480,6 +519,7 @@ def build_graph():
         route_after_jump,
         {
             "index_symbol": "index_symbol",
+            "finish": "finish",
             "fail": "fail",
         },
     )

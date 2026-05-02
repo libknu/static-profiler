@@ -1,0 +1,22 @@
+Round: round1
+Bucket: overall
+Outputs directory: LLM_icall_resolver/outputs
+Total runs with final.json: 2753
+
+Resolution statistics:
+- resolved: 693 (25.2%)
+- unresolved: 398 (14.5%)
+- not_icall: 19 (0.7%)
+- failed: 1643 (59.7%)
+
+Failed cases by primary reason:
+- LLM returned fail decision: 882
+- retrieval failed: 376
+- loop detected: 141
+- unsupported kind: 68
+- max hops exceeded: 67
+- batch response processing failed: 43
+- missing batch output: 29
+- definition not found: 28
+- missing required arguments: 8
+- other: 1

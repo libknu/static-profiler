@@ -6,6 +6,7 @@ import os
 import shlex
 import shutil
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,7 @@ ADD_LIST_FIELDS = {
 }
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
+MAX_ROUNDS_DEFAULT = 30
 
 
 @dataclass
@@ -120,15 +122,94 @@ def make_args(values: dict[str, Any]):
     return argparse.Namespace(**values)
 
 
-def prepare_case_output(output_root: Path, run_name: str, overwrite: bool, skip_existing: bool) -> str | None:
+def load_case_names(case_file: Path | None) -> set[str] | None:
+    if case_file is None:
+        return None
+    names: set[str] = set()
+    for line in case_file.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        names.add(text.split(",", 1)[0].strip())
+    return names
+
+
+def summarize_case_statuses(cases: list[Case]) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for case in cases:
+        if case.done:
+            counts["done"] += 1
+        else:
+            counts["pending"] += 1
+        status = case.state.get("icall_resolution_status") or "unknown"
+        counts[f"icall_{status}"] += 1
+    return counts
+
+
+def preview_case_names(cases: list[Case], limit: int = 5) -> str:
+    names = [case.run_name for case in cases[:limit]]
+    if not names:
+        return "-"
+    if len(cases) > limit:
+        return ", ".join(names) + f", ... (+{len(cases) - limit} more)"
+    return ", ".join(names)
+
+
+def load_existing_final(output_dir: Path) -> dict[str, Any] | None:
+    final_path = output_dir / "final.json"
+    if not final_path.exists():
+        return None
+    try:
+        return json.loads(final_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def is_resolved_final(data: dict[str, Any] | None) -> bool:
+    if not data:
+        return False
+    return (
+        data.get("icall_resolution_status") == "resolved"
+        or bool(data.get("icall_resolved"))
+        or bool(data.get("icall_targets"))
+    )
+
+
+def archive_existing_output(output_dir: Path) -> Path:
+    base_name = f"old.{output_dir.name}"
+    archive_dir = output_dir.with_name(base_name)
+    if not archive_dir.exists():
+        shutil.move(str(output_dir), str(archive_dir))
+        return archive_dir
+
+    index = 1
+    while True:
+        candidate = output_dir.with_name(f"{base_name}.{index}")
+        if not candidate.exists():
+            shutil.move(str(output_dir), str(candidate))
+            return candidate
+        index += 1
+
+
+def prepare_case_output(
+    output_root: Path,
+    run_name: str,
+    overwrite: bool,
+    skip_existing: bool,
+    skip_resolved: bool = False,
+    archive_existing: bool = False,
+) -> str | None:
     output_dir = output_root / run_name
     if output_dir.exists():
-        if skip_existing and (output_dir / "final.json").exists():
+        existing_final = load_existing_final(output_dir)
+        if skip_resolved and is_resolved_final(existing_final):
+            return None
+        if skip_existing and existing_final is not None:
             return None
         if overwrite:
             shutil.rmtree(output_dir)
-        elif (output_dir / "final.json").exists():
-            return None
+        elif archive_existing and existing_final is not None:
+            archive_existing_output(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     return str(output_dir)
 
@@ -141,6 +222,9 @@ def initialize_cases(
     limit: int | None,
     overwrite: bool,
     skip_existing: bool,
+    skip_resolved: bool,
+    archive_existing: bool,
+    case_names: set[str] | None,
     model: str,
 ) -> list[Case]:
     cases: list[Case] = []
@@ -149,15 +233,19 @@ def initialize_cases(
         scripts = scripts[:limit]
 
     for script in scripts:
+        run_name = sanitize_name(script.stem)
+        if case_names is not None and run_name not in case_names:
+            continue
         try:
             values = parse_input_script(script, workspace_root=workspace_root, project_root=project_root)
         except ValueError as exc:
-            run_name = sanitize_name(script.stem)
             output_dir = prepare_case_output(
                 output_root=output_root,
                 run_name=run_name,
                 overwrite=overwrite,
                 skip_existing=skip_existing,
+                skip_resolved=skip_resolved,
+                archive_existing=archive_existing,
             )
             if output_dir is None:
                 continue
@@ -210,11 +298,15 @@ def initialize_cases(
 
         values["model"] = model
         run_name = sanitize_name(values["run_name"])
+        if case_names is not None and run_name not in case_names:
+            continue
         output_dir = prepare_case_output(
             output_root=output_root,
             run_name=run_name,
             overwrite=overwrite,
             skip_existing=skip_existing,
+            skip_resolved=skip_resolved,
+            archive_existing=archive_existing,
         )
         if output_dir is None:
             continue
@@ -281,6 +373,7 @@ def replay_existing_steps(case: Case) -> None:
                     "current_path",
                     "current_line",
                     "current_kind",
+                    "hop_count",
                     "visited_symbols",
                     "reference_jump_candidates",
                 }
@@ -296,7 +389,7 @@ def replay_existing_steps(case: Case) -> None:
             "summary": llm_output["analysis_summary"],
             "evidence": llm_output["evidence"],
             "candidate_callees": llm_output["candidate_callees"],
-            "resolved": llm_output["resolved"],
+            "resolved": llm_output.get("resolved", bool(llm_output["candidate_callees"])),
             "jump_kind": step_payload.get("jump_kind"),
             "grounded_sources": step_payload.get("grounded_sources", []),
             "selected_from_reference_candidates": step_payload.get(
@@ -506,7 +599,7 @@ def apply_llm_result(case: Case, llm_output: dict[str, Any], prompt_payload: dic
         "summary": llm_output["analysis_summary"],
         "evidence": llm_output["evidence"],
         "candidate_callees": llm_output["candidate_callees"],
-        "resolved": llm_output["resolved"],
+        "resolved": llm_output.get("resolved", bool(llm_output["candidate_callees"])),
         "jump_kind": jump_kind,
         "grounded_sources": grounded_sources,
         "selected_from_reference_candidates": selected_from_reference_candidates,
@@ -535,6 +628,7 @@ def apply_llm_result(case: Case, llm_output: dict[str, Any], prompt_payload: dic
                 "current_path": state.get("current_path"),
                 "current_line": state.get("current_line"),
                 "current_kind": state.get("current_kind"),
+                "hop_count": state.get("hop_count", 0),
                 "visited_symbols": state.get("visited_symbols", []),
                 "reference_jump_candidates": state.get("reference_jump_candidates", []),
             },
@@ -592,6 +686,7 @@ def run_all(args: argparse.Namespace) -> None:
     inputs_dir = args.inputs_dir.expanduser()
     if not inputs_dir.is_absolute():
         inputs_dir = (PACKAGE_ROOT / inputs_dir).resolve()
+    case_names = load_case_names(args.cases_file.expanduser().resolve()) if args.cases_file else None
 
     cases = initialize_cases(
         inputs_dir=inputs_dir,
@@ -600,7 +695,10 @@ def run_all(args: argparse.Namespace) -> None:
         project_root=project_root,
         limit=args.limit,
         overwrite=args.overwrite,
-        skip_existing=not args.no_skip_existing,
+        skip_existing=(not args.no_skip_existing) and (not args.rerun_unresolved),
+        skip_resolved=args.rerun_unresolved,
+        archive_existing=args.rerun_unresolved and not args.overwrite,
+        case_names=case_names,
         model=args.model,
     )
     print(f"loaded {len(cases)} case(s)")
@@ -608,6 +706,15 @@ def run_all(args: argparse.Namespace) -> None:
     if resumed_steps:
         resumed_cases = sum(1 for case in cases if case.resumed_steps)
         print(f"resumed {resumed_steps} saved step(s) across {resumed_cases} case(s)")
+    status_counts = summarize_case_statuses(cases)
+    print(
+        "initial status: "
+        f"pending={status_counts['pending']} done={status_counts['done']} "
+        f"resolved={status_counts['icall_resolved']} "
+        f"unresolved={status_counts['icall_unresolved']} "
+        f"not_icall={status_counts['icall_not_icall']} "
+        f"failed={status_counts['icall_failed']}"
+    )
     if not cases:
         print("no cases to run")
         return
@@ -631,16 +738,34 @@ def run_all(args: argparse.Namespace) -> None:
 
     round_no = 1
     while True:
+        if round_no > args.max_rounds:
+            pending = [case for case in cases if not case.done]
+            print(
+                f"stopping because round limit was reached: max_rounds={args.max_rounds} "
+                f"pending={len(pending)}"
+            )
+            break
+
         pending = [case for case in cases if not case.done]
         if not pending:
             break
 
-        print(f"round {round_no}: preparing {len(pending)} pending case(s)")
+        round_status = summarize_case_statuses(cases)
+        print(
+            f"round {round_no}/{args.max_rounds}: "
+            f"pending={round_status['pending']} done={round_status['done']} "
+            f"resolved={round_status['icall_resolved']} "
+            f"unresolved={round_status['icall_unresolved']} "
+            f"not_icall={round_status['icall_not_icall']} "
+            f"failed={round_status['icall_failed']}"
+        )
+        print(f"round {round_no}: pending preview: {preview_case_names(pending)}")
         for case in pending:
             run_local_until_llm(case)
 
         pending = [case for case in cases if not case.done]
         if not pending:
+            print(f"round {round_no}: all cases completed locally before batch submission")
             break
 
         requests = []
@@ -656,7 +781,10 @@ def run_all(args: argparse.Namespace) -> None:
             requests=requests,
             round_no=round_no,
         )
-        print(f"submitted round {round_no}: batch={batch.id} input={input_path}")
+        print(
+            f"submitted round {round_no}: batch={batch.id} "
+            f"requests={len(requests)} input={input_path}"
+        )
 
         if args.submit_only:
             print("submit-only mode: stopping after first batch submission")
@@ -664,6 +792,14 @@ def run_all(args: argparse.Namespace) -> None:
 
         batch = wait_for_batch(client, batch.id, args.poll_seconds)
         outputs = fetch_batch_outputs(client, batch, batch_dir=batch_dir, round_no=round_no)
+        print(
+            f"round {round_no}: batch completed status={batch.status} "
+            f"output_file={batch.output_file_id} "
+            f"request_counts="
+            f"completed={getattr(batch.request_counts, 'completed', 0) if batch.request_counts else 0}, "
+            f"failed={getattr(batch.request_counts, 'failed', 0) if batch.request_counts else 0}, "
+            f"total={getattr(batch.request_counts, 'total', 0) if batch.request_counts else 0}"
+        )
 
         for custom_id, (case, prompt_payload, prompt_text) in request_context.items():
             item = outputs.get(custom_id)
@@ -676,6 +812,14 @@ def run_all(args: argparse.Namespace) -> None:
             except Exception as exc:
                 mark_batch_error(case, f"batch response processing failed for {custom_id}: {exc}")
 
+        round_status = summarize_case_statuses(cases)
+        print(
+            f"round {round_no}: post-apply pending={round_status['pending']} done={round_status['done']} "
+            f"resolved={round_status['icall_resolved']} "
+            f"unresolved={round_status['icall_unresolved']} "
+            f"not_icall={round_status['icall_not_icall']} "
+            f"failed={round_status['icall_failed']}"
+        )
         round_no += 1
 
     print("done")
@@ -695,6 +839,7 @@ def main() -> None:
     parser.add_argument("--model", default=os.environ.get("LLM_ICALL_MODEL", DEFAULT_MODEL_NAME))
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--poll-seconds", type=int, default=60)
+    parser.add_argument("--max-rounds", type=int, default=MAX_ROUNDS_DEFAULT)
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--submit-only", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -702,6 +847,20 @@ def main() -> None:
         "--no-skip-existing",
         action="store_true",
         help="include runs that already have final.json unless --overwrite is also used",
+    )
+    parser.add_argument(
+        "--rerun-unresolved",
+        action="store_true",
+        help=(
+            "skip runs whose existing final.json is resolved, archive the remaining "
+            "existing outputs under old.<run_name>, and rerun them"
+        ),
+    )
+    parser.add_argument(
+        "--cases-file",
+        type=Path,
+        default=None,
+        help="optional file with one run_name per line to limit the cases that are loaded",
     )
     args = parser.parse_args()
     run_all(args)

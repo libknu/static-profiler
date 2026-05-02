@@ -436,6 +436,36 @@ def find_declaration_by_name_and_line(
     return None
 
 
+def find_declaration_by_name(root: Node, source: bytes, symbol: str) -> Optional[Node]:
+    for node in iter_nodes(root):
+        if node.type != "declaration":
+            continue
+        text = node_text(node, source)
+        if re.search(rf"\b{re.escape(symbol)}\b", text):
+            return node
+    return None
+
+
+def get_nearby_source_snippet(
+    project_root: str,
+    relative_path: str,
+    line_1_based: int,
+    radius: int = 25,
+) -> tuple[str, str]:
+    file_path = Path(project_root) / relative_path
+    lines = read_text_safe(file_path).splitlines()
+    if not lines:
+        return "", "source_snippet"
+
+    start = max(1, line_1_based - radius)
+    end = min(len(lines), line_1_based + radius)
+    numbered = [
+        f"{line_no}: {lines[line_no - 1]}"
+        for line_no in range(start, end + 1)
+    ]
+    return "\n".join(numbered), "source_snippet"
+
+
 def get_global_symbol_source(
     project_root: str,
     relative_path: str,
@@ -452,8 +482,12 @@ def get_global_symbol_source(
         tree.root_node, source, symbol, line_1_based
     )
     if decl_node is None:
-        raise ValueError(
-            f"global declaration not found: symbol={symbol}, line={line_1_based}, file={file_path}"
+        decl_node = find_declaration_by_name(tree.root_node, source, symbol)
+    if decl_node is None:
+        return get_nearby_source_snippet(
+            project_root=project_root,
+            relative_path=relative_path,
+            line_1_based=line_1_based,
         )
 
     return node_text(decl_node, source), "global_declaration"
