@@ -25,6 +25,18 @@ def derive_run_name(args) -> str:
     return f"{caller}_{loc}"
 
 
+def infer_icall_line_from_name(name: str | None) -> int | None:
+    if not name:
+        return None
+    parts = sanitize_name(name).rsplit("_", 3)
+    if len(parts) != 4:
+        return None
+    line, bb, insn = parts[1:]
+    if line.isdigit() and bb.isdigit() and insn.isdigit():
+        return int(line)
+    return None
+
+
 def build_initial_state(args, run_name: str, output_dir: str) -> dict:
     return {
         "project_root": args.project_root,
@@ -37,6 +49,7 @@ def build_initial_state(args, run_name: str, output_dir: str) -> dict:
         "current_symbol": args.caller_symbol,
         "icall_expr": args.icall_expr,
         "icall_location": args.icall_location,
+        "icall_line": args.icall_line,
 
         "visited_symbols": [args.caller_symbol],
         "retrieved_chunks": [],
@@ -51,6 +64,7 @@ def build_initial_state(args, run_name: str, output_dir: str) -> dict:
         "hop_count": 0,
         "iteration": 0,
         "max_hops": args.max_hops,
+        "max_iterations": args.max_iterations,
         "status": "running",
         "icall_resolution_status": "unresolved",
         "icall_resolved": False,
@@ -124,8 +138,10 @@ def main():
     parser.add_argument("--caller-symbol", default="key_call_socket")
     parser.add_argument("--icall-expr", default="clnt_call(clnt, proc, xdr_arg, arg, xdr_rslt, rslt, wait_time)")
     parser.add_argument("--icall-location", default="sunrpc/key_call.c")
+    parser.add_argument("--icall-line", type=int, default=None)
 
     parser.add_argument("--max-hops", type=int, default=6)
+    parser.add_argument("--max-iterations", type=int, default=10)
     parser.add_argument("--run-name", default=os.environ.get("LLM_ICALL_RUN_NAME"))
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
 
@@ -143,6 +159,8 @@ def main():
     args = parser.parse_args()
 
     run_name = derive_run_name(args)
+    if args.icall_line is None:
+        args.icall_line = infer_icall_line_from_name(run_name)
     output_dir = prepare_output_dir(args.output_root, run_name)
 
     initial_state = build_initial_state(args, run_name=run_name, output_dir=output_dir)

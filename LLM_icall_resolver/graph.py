@@ -9,6 +9,7 @@ except ModuleNotFoundError:
 from .state import ResolverState
 from .bootlin import bootlin_ident
 from .treesitter_retriever import (
+    get_enclosing_function_info,
     get_context_bundle,
     get_reference_jump_candidates,
 )
@@ -107,6 +108,34 @@ def select_definition(defs: list[dict], icall_location: str | None) -> dict:
 def index_symbol(state: ResolverState) -> ResolverState:
     symbol = state["current_symbol"]
 
+    if state.get("hop_count", 0) == 0 and state.get("icall_location") and state.get("icall_line"):
+        callsite_def = get_enclosing_function_info(
+            project_root=state["project_root"],
+            relative_path=state["icall_location"],
+            line_1_based=int(state["icall_line"]),
+        )
+        if callsite_def is not None:
+            callsite_symbol = callsite_def["symbol"]
+            observations = [
+                (
+                    "selected original callsite enclosing function "
+                    f"{callsite_symbol} at {callsite_def['path']}:{callsite_def['line']}"
+                )
+            ]
+            if callsite_symbol != symbol:
+                observations.append(
+                    f"caller_symbol {symbol} differs from callsite enclosing function {callsite_symbol}"
+                )
+            return {
+                "current_symbol": callsite_symbol,
+                "current_path": callsite_def["path"],
+                "current_line": int(callsite_def["line"]),
+                "current_kind": callsite_def["type"],
+                "visited_symbols": [callsite_symbol] if callsite_symbol != symbol else [],
+                "bootlin_references": [],
+                "observations": observations,
+            }
+
     ident = bootlin_ident(
         project=state["project"],
         version=state["version"],
@@ -173,6 +202,8 @@ def retrieve_block(state: ResolverState) -> ResolverState:
             line_1_based=state["current_line"],
             icall_expr=state["icall_expr"],
             ident_kind=state["current_kind"],
+            icall_location=state.get("icall_location"),
+            icall_line=state.get("icall_line"),
         )
     except Exception as e:
         return {
@@ -182,6 +213,8 @@ def retrieve_block(state: ResolverState) -> ResolverState:
         }
 
     chunks = [bundle["primary_block"]]
+    if bundle.get("callsite_context"):
+        chunks.insert(0, bundle["callsite_context"])
 
     for x in bundle["macro_definitions"]:
         chunks.append(f"[macro] {x['path']}:{x['line']}\n{x['text']}")
@@ -203,6 +236,10 @@ def retrieve_block(state: ResolverState) -> ResolverState:
         observations.append(f"found {len(bundle['local_assignments'])} related local assignments")
     if bundle["initializer_definitions"]:
         observations.append(f"found {len(bundle['initializer_definitions'])} related initializer snippets")
+    if bundle.get("callsite_context"):
+        observations.append(
+            f"included original callsite context from {state.get('icall_location')}:{state.get('icall_line')}"
+        )
 
     return {
         "current_block": "\n\n".join(chunks),
@@ -250,6 +287,16 @@ def expand_reference_candidates(state: ResolverState) -> ResolverState:
 
 
 def analyze_with_llm(state: ResolverState) -> ResolverState:
+    if state.get("iteration", 0) >= state.get("max_iterations", 10):
+        return {
+            "status": "failed",
+            "final_answer": (
+                f"max iterations exceeded: iteration={state.get('iteration', 0)} "
+                f"max_iterations={state.get('max_iterations', 10)}"
+            ),
+            "observations": ["stopped before LLM call because max_iterations was reached"],
+        }
+
     bundle = llm_analyze_step(state)
     result = bundle["llm_output"]
 
@@ -304,10 +351,13 @@ def analyze_with_llm(state: ResolverState) -> ResolverState:
                 "current_symbol": state.get("current_symbol"),
                 "caller_symbol": state.get("caller_symbol"),
                 "icall_expr": state.get("icall_expr"),
+                "icall_location": state.get("icall_location"),
+                "icall_line": state.get("icall_line"),
                 "current_path": state.get("current_path"),
                 "current_line": state.get("current_line"),
                 "current_kind": state.get("current_kind"),
                 "hop_count": state.get("hop_count", 0),
+                "max_iterations": state.get("max_iterations", 10),
                 "visited_symbols": state.get("visited_symbols", []),
                 "reference_jump_candidates": state.get("reference_jump_candidates", []),
             },
@@ -386,6 +436,7 @@ def finish(state: ResolverState) -> ResolverState:
 
     lines = []
     lines.append(f"ICall expression: {state.get('icall_expr', '')}")
+    lines.append(f"ICall location: {state.get('icall_location', '')}:{state.get('icall_line', '')}")
     lines.append(f"Caller symbol: {state.get('caller_symbol', '')}")
     lines.append(f"ICall resolution status: {icall_resolution_status}")
     lines.append(f"ICall resolved: {icall_resolved}")

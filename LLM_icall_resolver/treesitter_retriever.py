@@ -2,10 +2,62 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional, Iterable
+from functools import lru_cache
+import hashlib
+import json
+import os
 import re
+import threading
 
 import tree_sitter_c as tsc
 from tree_sitter import Language, Parser, Node
+
+
+CACHE_VERSION = "treesitter_retriever_v1"
+
+
+def _cache_root() -> Path:
+    return Path(os.environ.get("LLM_ICALL_CACHE_DIR", "/tmp/llm_icall_resolver_cache"))
+
+
+def _cache_enabled() -> bool:
+    return os.environ.get("LLM_ICALL_DISABLE_CACHE", "").lower() not in {"1", "true", "yes"}
+
+
+def _cache_path(namespace: str, payload: object) -> Path:
+    raw = json.dumps(
+        {"version": CACHE_VERSION, "namespace": namespace, "payload": payload},
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return _cache_root() / namespace / f"{digest}.json"
+
+
+def _disk_cache_get(namespace: str, payload: object):
+    if not _cache_enabled():
+        return None
+    path = _cache_path(namespace, payload)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _disk_cache_set(namespace: str, payload: object, value: object) -> None:
+    if not _cache_enabled():
+        return
+    path = _cache_path(namespace, payload)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        return
 
 
 def get_c_language() -> Language:
@@ -16,10 +68,12 @@ def build_parser() -> Parser:
     return Parser(get_c_language())
 
 
+@lru_cache(maxsize=4096)
 def read_text_safe(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
+@lru_cache(maxsize=4096)
 def read_bytes_safe(path: Path) -> bytes:
     return path.read_bytes()
 
@@ -88,6 +142,16 @@ def get_function_source(
     symbol: str,
     line_1_based: int,
 ) -> tuple[str, str]:
+    cache_payload = {
+        "project_root": project_root,
+        "relative_path": relative_path,
+        "symbol": symbol,
+        "line_1_based": line_1_based,
+    }
+    cached = _disk_cache_get("function_source", cache_payload)
+    if cached is not None:
+        return cached["text"], cached["kind"]
+
     file_path = Path(project_root) / relative_path
     source = read_bytes_safe(file_path)
 
@@ -123,7 +187,9 @@ def get_function_source(
             f"function not found: symbol={symbol}, line={line_1_based}, file={file_path}"
         )
 
-    return node_text(fn_node, source), "function_definition"
+    result = {"text": node_text(fn_node, source), "kind": "function_definition"}
+    _disk_cache_set("function_source", cache_payload, result)
+    return result["text"], result["kind"]
 
 def extract_call_like_identifier(icall_expr: str) -> Optional[str]:
     matches = re.findall(r"([A-Za-z_]\w*)\s*\(", icall_expr)
@@ -145,10 +211,11 @@ def extract_field_names(expr: str) -> list[str]:
     return list(dict.fromkeys(re.findall(r"(?:->|\.)([A-Za-z_]\w*)", expr)))
 
 
-def collect_c_family_files(project_root: str) -> list[Path]:
+@lru_cache(maxsize=8)
+def collect_c_family_files(project_root: str) -> tuple[Path, ...]:
     root = Path(project_root)
     exts = {".c", ".h", ".hpp", ".hh", ".cc"}
-    return [p for p in root.rglob("*") if p.is_file() and p.suffix in exts]
+    return tuple(p for p in root.rglob("*") if p.is_file() and p.suffix in exts)
 
 
 def get_macro_definitions(
@@ -156,6 +223,15 @@ def get_macro_definitions(
     macro_name: str,
     max_results: int = 5,
 ) -> list[dict]:
+    cache_payload = {
+        "project_root": project_root,
+        "macro_name": macro_name,
+        "max_results": max_results,
+    }
+    cached = _disk_cache_get("macro_definitions", cache_payload)
+    if cached is not None:
+        return cached
+
     results: list[dict] = []
     define_pat = re.compile(rf"^\s*#\s*define\s+{re.escape(macro_name)}\b")
 
@@ -179,10 +255,12 @@ def get_macro_definitions(
                     }
                 )
                 if len(results) >= max_results:
+                    _disk_cache_set("macro_definitions", cache_payload, results)
                     return results
                 i = j
             else:
                 i += 1
+    _disk_cache_set("macro_definitions", cache_payload, results)
     return results
 
 
@@ -217,6 +295,15 @@ def get_struct_definitions_for_field(
     field_name: str,
     max_results: int = 5,
 ) -> list[dict]:
+    cache_payload = {
+        "project_root": project_root,
+        "field_name": field_name,
+        "max_results": max_results,
+    }
+    cached = _disk_cache_get("struct_definitions_for_field", cache_payload)
+    if cached is not None:
+        return cached
+
     results: list[dict] = []
     field_pat = re.compile(rf"\b{re.escape(field_name)}\b")
 
@@ -244,7 +331,9 @@ def get_struct_definitions_for_field(
                     }
                 )
                 if len(results) >= max_results:
+                    _disk_cache_set("struct_definitions_for_field", cache_payload, results)
                     return results
+    _disk_cache_set("struct_definitions_for_field", cache_payload, results)
     return results
 
 
@@ -279,6 +368,16 @@ def get_local_assignment_lines(
     identifiers: list[str],
     max_results: int = 10,
 ) -> list[dict]:
+    cache_payload = {
+        "relative_path": relative_path,
+        "function_text": function_text,
+        "identifiers": identifiers,
+        "max_results": max_results,
+    }
+    cached = _disk_cache_get("local_assignment_lines", cache_payload)
+    if cached is not None:
+        return cached
+
     results: list[dict] = []
     pats = [
         re.compile(rf"\b{re.escape(ident)}\b.*=") for ident in identifiers if ident
@@ -295,7 +394,9 @@ def get_local_assignment_lines(
                 }
             )
             if len(results) >= max_results:
+                _disk_cache_set("local_assignment_lines", cache_payload, results)
                 return results
+    _disk_cache_set("local_assignment_lines", cache_payload, results)
     return results
 
 
@@ -337,6 +438,75 @@ def get_macro_source(
     )
 
 
+def get_callsite_context(
+    project_root: str,
+    relative_path: Optional[str],
+    line_1_based: Optional[int],
+) -> str:
+    if not relative_path or not line_1_based:
+        return ""
+
+    file_path = Path(project_root) / relative_path
+    if not file_path.exists():
+        return ""
+
+    source = read_bytes_safe(file_path)
+    parser = build_parser()
+    tree = parser.parse(source)
+    fn = find_enclosing_function_by_line(tree.root_node, source, line_1_based)
+    if fn is not None:
+        text = node_text(fn, source)
+        return f"[original_callsite] {relative_path}:{line_1_based}\n{text}"
+
+    snippet, _ = get_nearby_source_snippet(
+        project_root=project_root,
+        relative_path=relative_path,
+        line_1_based=line_1_based,
+        radius=80,
+    )
+    return f"[original_callsite] {relative_path}:{line_1_based}\n{snippet}"
+
+
+def get_enclosing_function_info(
+    project_root: str,
+    relative_path: str,
+    line_1_based: int,
+) -> Optional[dict]:
+    cache_payload = {
+        "project_root": project_root,
+        "relative_path": relative_path,
+        "line_1_based": line_1_based,
+    }
+    cached = _disk_cache_get("enclosing_function", cache_payload)
+    if cached is not None:
+        return cached
+
+    file_path = Path(project_root) / relative_path
+    if not file_path.exists():
+        return None
+
+    source = read_bytes_safe(file_path)
+    parser = build_parser()
+    tree = parser.parse(source)
+    fn = find_enclosing_function_by_line(tree.root_node, source, line_1_based)
+    if fn is None:
+        return None
+
+    name = get_function_name_from_definition(fn, source)
+    if not name:
+        return None
+
+    result = {
+        "path": relative_path,
+        "line": fn.start_point[0] + 1,
+        "type": "function",
+        "symbol": name,
+        "source": "callsite_enclosing_function",
+    }
+    _disk_cache_set("enclosing_function", cache_payload, result)
+    return result
+
+
 
 
 def get_context_bundle(
@@ -346,7 +516,23 @@ def get_context_bundle(
     line_1_based: int,
     icall_expr: str,
     ident_kind: str = "function",
+    icall_location: Optional[str] = None,
+    icall_line: Optional[int] = None,
 ) -> dict:
+    cache_payload = {
+        "project_root": project_root,
+        "relative_path": relative_path,
+        "symbol": symbol,
+        "line_1_based": line_1_based,
+        "icall_expr": icall_expr,
+        "ident_kind": ident_kind,
+        "icall_location": icall_location,
+        "icall_line": icall_line,
+    }
+    cached = _disk_cache_get("context_bundle", cache_payload)
+    if cached is not None:
+        return cached
+
     if ident_kind == "macro":
         primary_text, primary_kind = get_macro_source(
                 project_root=project_root,
@@ -403,15 +589,23 @@ def get_context_bundle(
         identifiers=field_names + ([callee_token] if callee_token else []),
         max_results=10,
     )
+    callsite_context = get_callsite_context(
+        project_root=project_root,
+        relative_path=icall_location,
+        line_1_based=icall_line,
+    )
 
-    return {
+    result = {
         "primary_block": primary_text,
         "primary_block_kind": primary_kind,
+        "callsite_context": callsite_context,
         "macro_definitions": macro_defs,
         "struct_definitions": struct_defs,
         "local_assignments": local_assignments,
         "initializer_definitions": initializer_defs,
     }
+    _disk_cache_set("context_bundle", cache_payload, result)
+    return result
 
 
 def find_declaration_by_name_and_line(
@@ -452,6 +646,16 @@ def get_nearby_source_snippet(
     line_1_based: int,
     radius: int = 25,
 ) -> tuple[str, str]:
+    cache_payload = {
+        "project_root": project_root,
+        "relative_path": relative_path,
+        "line_1_based": line_1_based,
+        "radius": radius,
+    }
+    cached = _disk_cache_get("nearby_source_snippet", cache_payload)
+    if cached is not None:
+        return cached["text"], cached["kind"]
+
     file_path = Path(project_root) / relative_path
     lines = read_text_safe(file_path).splitlines()
     if not lines:
@@ -463,7 +667,9 @@ def get_nearby_source_snippet(
         f"{line_no}: {lines[line_no - 1]}"
         for line_no in range(start, end + 1)
     ]
-    return "\n".join(numbered), "source_snippet"
+    result = {"text": "\n".join(numbered), "kind": "source_snippet"}
+    _disk_cache_set("nearby_source_snippet", cache_payload, result)
+    return result["text"], result["kind"]
 
 
 def get_global_symbol_source(
@@ -472,6 +678,16 @@ def get_global_symbol_source(
     symbol: str,
     line_1_based: int,
 ) -> tuple[str, str]:
+    cache_payload = {
+        "project_root": project_root,
+        "relative_path": relative_path,
+        "symbol": symbol,
+        "line_1_based": line_1_based,
+    }
+    cached = _disk_cache_get("global_symbol_source", cache_payload)
+    if cached is not None:
+        return cached["text"], cached["kind"]
+
     file_path = Path(project_root) / relative_path
     source = read_bytes_safe(file_path)
 
@@ -484,13 +700,17 @@ def get_global_symbol_source(
     if decl_node is None:
         decl_node = find_declaration_by_name(tree.root_node, source, symbol)
     if decl_node is None:
-        return get_nearby_source_snippet(
+        result = get_nearby_source_snippet(
             project_root=project_root,
             relative_path=relative_path,
             line_1_based=line_1_based,
         )
+        _disk_cache_set("global_symbol_source", cache_payload, {"text": result[0], "kind": result[1]})
+        return result
 
-    return node_text(decl_node, source), "global_declaration"
+    result = {"text": node_text(decl_node, source), "kind": "global_declaration"}
+    _disk_cache_set("global_symbol_source", cache_payload, result)
+    return result["text"], result["kind"]
 
 def parse_bootlin_line_field(line_field) -> list[int]:
     if isinstance(line_field, int):
@@ -538,6 +758,15 @@ def get_reference_jump_candidates(
     references: list[dict],
     max_candidates: int = 8,
 ) -> list[dict]:
+    cache_payload = {
+        "project_root": project_root,
+        "references": references,
+        "max_candidates": max_candidates,
+    }
+    cached = _disk_cache_get("reference_jump_candidates", cache_payload)
+    if cached is not None:
+        return cached
+
     results = []
     seen = set()
 
@@ -577,8 +806,10 @@ def get_reference_jump_candidates(
             })
 
             if len(results) >= max_candidates:
+                _disk_cache_set("reference_jump_candidates", cache_payload, results)
                 return results
 
+    _disk_cache_set("reference_jump_candidates", cache_payload, results)
     return results
 
 def get_initializer_occurrences(
@@ -586,6 +817,15 @@ def get_initializer_occurrences(
     identifiers: list[str],
     max_results: int = 10,
 ) -> list[dict]:
+    cache_payload = {
+        "project_root": project_root,
+        "identifiers": identifiers,
+        "max_results": max_results,
+    }
+    cached = _disk_cache_get("initializer_occurrences", cache_payload)
+    if cached is not None:
+        return cached
+
     results: list[dict] = []
     identifiers = [x for x in identifiers if x]
     if not identifiers:
@@ -616,6 +856,8 @@ def get_initializer_occurrences(
                 }
             )
             if len(results) >= max_results:
+                _disk_cache_set("initializer_occurrences", cache_payload, results)
                 return results
 
+    _disk_cache_set("initializer_occurrences", cache_payload, results)
     return results

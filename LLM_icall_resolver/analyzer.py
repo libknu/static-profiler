@@ -108,6 +108,8 @@ def build_step_prompt_payload(state: dict) -> dict:
         "current_symbol": state.get("current_symbol"),
         "caller_symbol": state.get("caller_symbol"),
         "icall_expr": state.get("icall_expr"),
+        "icall_location": state.get("icall_location"),
+        "icall_line": state.get("icall_line"),
         "visited_symbols": state.get("visited_symbols", []),
         "bootlin_references": state.get("bootlin_references", []),
         "reference_jump_candidates": state.get("reference_jump_candidates", []),
@@ -126,6 +128,7 @@ Iteration: {payload.get("iteration")}
 Current symbol: {payload.get("current_symbol")}
 Caller: {payload.get("caller_symbol")}
 ICall: {payload.get("icall_expr")}
+ICall location: {payload.get("icall_location")}:{payload.get("icall_line")}
 
 Visited:
 {payload.get("visited_symbols")}

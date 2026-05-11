@@ -12,6 +12,7 @@ class ResolverState(TypedDict, total=False):
     caller_symbol: str
     icall_expr: str
     icall_location: str
+    icall_line: int
 
     current_symbol: str #index symbol
     current_path: str
@@ -41,6 +42,7 @@ class ResolverState(TypedDict, total=False):
     hop_count: int
     iteration: int
     max_hops: int
+    max_iterations: int
 
     status: Literal["running", "resolved", "failed"]
     icall_resolution_status: Literal["resolved", "unresolved", "not_icall", "failed"]

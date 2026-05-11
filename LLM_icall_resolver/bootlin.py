@@ -1,10 +1,61 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
 from pathlib import Path
 from typing import Optional
+import threading
 
 import requests
+
+
+CACHE_VERSION = "bootlin_v1"
+
+
+def _cache_root() -> Path:
+    return Path(os.environ.get("LLM_ICALL_CACHE_DIR", "/tmp/llm_icall_resolver_cache"))
+
+
+def _cache_enabled() -> bool:
+    return os.environ.get("LLM_ICALL_DISABLE_CACHE", "").lower() not in {"1", "true", "yes"}
+
+
+def _cache_path(namespace: str, payload: object) -> Path:
+    raw = json.dumps(
+        {"version": CACHE_VERSION, "namespace": namespace, "payload": payload},
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return _cache_root() / namespace / f"{digest}.json"
+
+
+def _disk_cache_get(namespace: str, payload: object):
+    if not _cache_enabled():
+        return None
+    path = _cache_path(namespace, payload)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _disk_cache_set(namespace: str, payload: object, value: object) -> None:
+    if not _cache_enabled():
+        return
+    path = _cache_path(namespace, payload)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        return
 
 
 def _bootlin_ident_remote(project: str, version: str, family: str, symbol: str) -> dict:
@@ -184,6 +235,17 @@ def bootlin_ident(
     symbol: str,
     project_root: Optional[str] = None,
 ) -> dict:
+    cache_payload = {
+        "project": project,
+        "version": version,
+        "family": family,
+        "symbol": symbol,
+        "project_root": project_root,
+    }
+    cached = _disk_cache_get("bootlin_ident", cache_payload)
+    if cached is not None:
+        return cached
+
     try:
         remote = _bootlin_ident_remote(project, version, family, symbol)
     except Exception:
@@ -199,12 +261,14 @@ def bootlin_ident(
 
     # 1) remote에 definition이 있으면 local fallback을 섞지 않음
     if remote_defs:
-        return {
+        result = {
             "definitions": _sort_definitions(_dedup_definitions(remote_defs)),
             "references": remote_refs,
             "documentations": remote.get("documentations", []),
             "source": "bootlin",
         }
+        _disk_cache_set("bootlin_ident", cache_payload, result)
+        return result
 
     # 2) remote definition이 없을 때만 local fallback 사용
     local_defs: list[dict] = []
@@ -213,12 +277,15 @@ def bootlin_ident(
         local_defs = local.get("definitions", []) or []
 
     if local_defs or remote_refs:
-        return {
+        result = {
             "definitions": _sort_definitions(_dedup_definitions(local_defs)),
             "references": remote_refs,
             "documentations": remote.get("documentations", []),
             "source": "local_fallback" if local_defs else "bootlin_refs_only",
         }
+        _disk_cache_set("bootlin_ident", cache_payload, result)
+        return result
 
     remote["source"] = "bootlin_empty"
+    _disk_cache_set("bootlin_ident", cache_payload, remote)
     return remote

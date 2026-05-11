@@ -97,7 +97,9 @@ exec "$PYTHON_BIN" -m LLM_icall_resolver.main \\
   --caller-symbol {shell_escape(func)} \\
   --icall-expr {shell_escape(icall_expr)} \\
   --icall-location {shell_escape(rel_path)} \\
+  --icall-line {line_no} \\
   --max-hops 10 \\
+  --max-iterations 10 \\
   --run-name "$CASE_NAME" \\
   --stream
 """

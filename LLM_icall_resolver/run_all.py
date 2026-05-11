@@ -6,6 +6,7 @@ import os
 import shlex
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,7 +82,9 @@ def parse_input_script(path: Path, workspace_root: Path, project_root: Path) -> 
         "caller_symbol": None,
         "icall_expr": None,
         "icall_location": None,
+        "icall_line": infer_icall_line_from_name(path.stem),
         "max_hops": 10,
+        "max_iterations": 10,
         "run_name": path.stem,
         "output_root": DEFAULT_OUTPUT_ROOT,
     }
@@ -105,7 +108,7 @@ def parse_input_script(path: Path, workspace_root: Path, project_root: Path) -> 
             value = path.stem
         elif key == "output_root" and "$WORKSPACE_ROOT" in value:
             value = value.replace("$WORKSPACE_ROOT", str(workspace_root))
-        if key == "max_hops":
+        if key in {"max_hops", "max_iterations", "icall_line"}:
             value = int(value)
         if key in values:
             values[key] = value
@@ -116,6 +119,16 @@ def parse_input_script(path: Path, workspace_root: Path, project_root: Path) -> 
         raise ValueError(f"missing required arguments in {path.name}: {', '.join(missing)}")
 
     return values
+
+
+def infer_icall_line_from_name(name: str) -> int | None:
+    parts = name.rsplit("_", 3)
+    if len(parts) != 4:
+        return None
+    line, bb, insn = parts[1:]
+    if line.isdigit() and bb.isdigit() and insn.isdigit():
+        return int(line)
+    return None
 
 
 def make_args(values: dict[str, Any]):
@@ -226,6 +239,7 @@ def initialize_cases(
     archive_existing: bool,
     case_names: set[str] | None,
     model: str,
+    max_iterations: int,
 ) -> list[Case]:
     cases: list[Case] = []
     scripts = sorted(inputs_dir.glob("*.sh"))
@@ -258,6 +272,7 @@ def initialize_cases(
                 "caller_symbol": "",
                 "icall_expr": "",
                 "icall_location": "",
+                "icall_line": None,
                 "visited_symbols": [],
                 "retrieved_chunks": [],
                 "observations": [str(exc)],
@@ -270,6 +285,7 @@ def initialize_cases(
                 "hop_count": 0,
                 "iteration": 0,
                 "max_hops": 0,
+                "max_iterations": 10,
                 "status": "failed",
                 "icall_resolution_status": "failed",
                 "icall_resolved": False,
@@ -297,6 +313,7 @@ def initialize_cases(
             continue
 
         values["model"] = model
+        values["max_iterations"] = max_iterations
         run_name = sanitize_name(values["run_name"])
         if case_names is not None and run_name not in case_names:
             continue
@@ -370,10 +387,13 @@ def replay_existing_steps(case: Case) -> None:
                     "current_symbol",
                     "caller_symbol",
                     "icall_expr",
+                    "icall_location",
+                    "icall_line",
                     "current_path",
                     "current_line",
                     "current_kind",
                     "hop_count",
+                    "max_iterations",
                     "visited_symbols",
                     "reference_jump_candidates",
                 }
@@ -443,6 +463,22 @@ def run_local_until_llm(case: Case) -> None:
         case.done = True
         return
 
+    if state.get("iteration", 0) >= state.get("max_iterations", 10):
+        state = merge_state(
+            state,
+            {
+                "status": "failed",
+                "final_answer": (
+                    f"max iterations exceeded: iteration={state.get('iteration', 0)} "
+                    f"max_iterations={state.get('max_iterations', 10)}"
+                ),
+            },
+        )
+        case.state = merge_state(state, fail(state))
+        save_final_result(case.state["output_dir"], case.state)
+        case.done = True
+        return
+
     for node in (index_symbol, retrieve_block):
         state = merge_state(state, node(state))
         if state.get("status") == "failed":
@@ -454,6 +490,62 @@ def run_local_until_llm(case: Case) -> None:
 
     state = merge_state(state, expand_reference_candidates(state))
     case.state = state
+
+
+def run_local_until_llm_many(cases: list[Case], workers: int) -> None:
+    pending = [case for case in cases if not case.done]
+    if not pending:
+        return
+    total = len(pending)
+    workers = max(1, workers)
+    if workers == 1 or len(pending) == 1:
+        print(f"local prepare: workers=1 cases={total}", flush=True)
+        started_at = time.monotonic()
+        for case in pending:
+            case_started_at = time.monotonic()
+            run_local_until_llm(case)
+            completed = pending.index(case) + 1
+            elapsed = time.monotonic() - case_started_at
+            total_elapsed = time.monotonic() - started_at
+            print(
+                f"local prepare: completed={completed}/{total} "
+                f"status={case.state.get('status')} elapsed={elapsed:.1f}s "
+                f"total_elapsed={total_elapsed:.1f}s case={case.run_name}",
+                flush=True,
+            )
+        return
+
+    workers = min(workers, len(pending))
+    print(f"local prepare: workers={workers} cases={total}", flush=True)
+    completed = 0
+    started_at = time.monotonic()
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_case = {executor.submit(run_local_until_llm, case): (case, time.monotonic()) for case in pending}
+        for future in as_completed(future_to_case):
+            case, case_started_at = future_to_case[future]
+            try:
+                future.result()
+            except Exception as exc:
+                state = merge_state(
+                    case.state,
+                    {
+                        "status": "failed",
+                        "final_answer": f"local prepare failed: {exc}",
+                    },
+                )
+                case.state = merge_state(state, fail(state))
+                case.done = True
+                save_final_result(case.state["output_dir"], case.state)
+                print(f"local prepare failed: {case.run_name}: {exc}", flush=True)
+            completed += 1
+            elapsed = time.monotonic() - case_started_at
+            total_elapsed = time.monotonic() - started_at
+            print(
+                f"local prepare: completed={completed}/{total} "
+                f"status={case.state.get('status')} elapsed={elapsed:.1f}s "
+                f"total_elapsed={total_elapsed:.1f}s case={case.run_name}",
+                flush=True,
+            )
 
 
 def build_batch_request(case: Case) -> tuple[str, dict[str, Any], str, str]:
@@ -625,10 +717,13 @@ def apply_llm_result(case: Case, llm_output: dict[str, Any], prompt_payload: dic
                 "current_symbol": state.get("current_symbol"),
                 "caller_symbol": state.get("caller_symbol"),
                 "icall_expr": state.get("icall_expr"),
+                "icall_location": state.get("icall_location"),
+                "icall_line": state.get("icall_line"),
                 "current_path": state.get("current_path"),
                 "current_line": state.get("current_line"),
                 "current_kind": state.get("current_kind"),
                 "hop_count": state.get("hop_count", 0),
+                "max_iterations": state.get("max_iterations", 10),
                 "visited_symbols": state.get("visited_symbols", []),
                 "reference_jump_candidates": state.get("reference_jump_candidates", []),
             },
@@ -700,6 +795,7 @@ def run_all(args: argparse.Namespace) -> None:
         archive_existing=args.rerun_unresolved and not args.overwrite,
         case_names=case_names,
         model=args.model,
+        max_iterations=args.max_iterations,
     )
     print(f"loaded {len(cases)} case(s)")
     resumed_steps = sum(case.resumed_steps for case in cases)
@@ -720,8 +816,7 @@ def run_all(args: argparse.Namespace) -> None:
         return
 
     if args.prepare_only:
-        for case in cases:
-            run_local_until_llm(case)
+        run_local_until_llm_many(cases, args.local_workers)
         pending = [case for case in cases if not case.done]
         requests = [build_batch_request(case)[1] for case in pending]
         input_path = write_batch_input(batch_dir=batch_dir, requests=requests, round_no=1)
@@ -760,8 +855,7 @@ def run_all(args: argparse.Namespace) -> None:
             f"failed={round_status['icall_failed']}"
         )
         print(f"round {round_no}: pending preview: {preview_case_names(pending)}")
-        for case in pending:
-            run_local_until_llm(case)
+        run_local_until_llm_many(pending, args.local_workers)
 
         pending = [case for case in cases if not case.done]
         if not pending:
@@ -840,6 +934,13 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--max-rounds", type=int, default=MAX_ROUNDS_DEFAULT)
+    parser.add_argument("--max-iterations", type=int, default=10)
+    parser.add_argument(
+        "--local-workers",
+        type=int,
+        default=4,
+        help="number of parallel workers for local retrieval before each Batch API round",
+    )
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--submit-only", action="store_true")
     parser.add_argument("--overwrite", action="store_true")

@@ -90,12 +90,15 @@ def order_final_result(result: dict) -> dict:
         "caller_symbol",
         "icall_expr",
         "icall_location",
+        "icall_line",
         "status",
         "icall_resolution_status",
         "icall_resolved",
         "icall_resolution_reason",
         "icall_targets",
         "candidate_callees",
+        "max_hops",
+        "max_iterations",
     ]
 
     ordered = {}
