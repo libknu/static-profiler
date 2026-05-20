@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-RESOLUTION_STATUSES = ("resolved", "unresolved", "not_icall", "failed")
+RESOLUTION_STATUSES = ("resolved", "unresolved", "not_icall", "inconclusive", "failed")
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -174,6 +174,7 @@ def write_status_lists(
         runs_by_status.get("failed", [])
         + runs_by_status.get("unresolved", [])
         + runs_by_status.get("not_icall", [])
+        + runs_by_status.get("inconclusive", [])
     )
     pending_path.write_text(
         "".join(f"{run_name}\n" for run_name in pending_runs),

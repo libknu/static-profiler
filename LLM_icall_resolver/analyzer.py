@@ -13,7 +13,11 @@ JSON_SCHEMA = {
     "properties": {
         "decision": {
             "type": "string",
-            "enum": ["jump", "finish", "fail"]
+            "enum": ["jump", "finish"]
+        },
+        "resolution_status": {
+            "type": "string",
+            "enum": ["resolved", "unresolved", "not_icall", "inconclusive"]
         },
         "next_symbol": {
             "type": ["string", "null"]
@@ -33,6 +37,7 @@ JSON_SCHEMA = {
         "decision",
         "next_symbol",
         "candidate_callees",
+        "resolution_status",
         "analysis_summary",
         "evidence",
         "resolved"
@@ -62,6 +67,17 @@ Rules:
 - Prefer value-flow relevant symbols, struct field providers, ops tables, wrapper-returning helpers, and initializer sources.
 - Do NOT hallucinate arbitrary symbols.
 - If unsure, continue with jump.
+- Use resolution_status="unresolved" only when the target is inherently not
+  statically decidable from source context, such as runtime-loaded providers,
+  user callbacks, configured dispatch tables, or dynamic loader/audit hooks.
+- If this is a real indirect call but the available evidence is insufficient,
+  there is no grounded next symbol, or analysis cannot confidently continue,
+  finish with resolution_status="inconclusive", candidate_callees=[],
+  resolved=false.
+- If the reported site is not an indirect call, finish with
+  resolution_status="not_icall", candidate_callees=[], resolved=false.
+- The decision field has only two valid values: "jump" and "finish".
+- Do not report ordinary unresolved static-analysis results as failures.
 
 Output MUST be valid JSON following the schema.
 """

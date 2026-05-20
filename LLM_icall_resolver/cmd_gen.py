@@ -2,6 +2,7 @@ import csv
 from pathlib import Path
 import shlex
 import os
+import re
 
 INPUT_CSV = "/home/jiwoo/workspace/out/2.41.bak/indirect_callsites.sorted.csv"
 GLIBC_ROOT = Path("/home/jiwoo/workspace/glibc-src/glibc-2.41")
@@ -14,11 +15,32 @@ def shell_escape(s: str) -> str:
     return shlex.quote(s)
 
 
+STRONG_INDIRECT_CALL_PATTERNS = [
+    re.compile(r"^\(\s*\*"),
+    re.compile(r"\(\s*\*[^)]*\)\s*\("),
+    re.compile(r"\bDL_CALL_FCT\s*\("),
+    re.compile(r"\bGL_READDIR\s*\("),
+    re.compile(r"\b[A-Z0-9_]+_(?:CALL|GET|PUT|SET|DESTROY|VALIDATE|MARSHALL|REFRESH|SYNC|SEEK|OVERFLOW|PBACKFAIL)\s*\("),
+    re.compile(r"->\s*[A-Za-z_]\w*\s*\("),
+    re.compile(r"\[[^]]+\]\s*\)\s*\("),
+]
+
+WEAK_INDIRECT_CALL_PATTERNS = [
+    re.compile(r"(?:^|=|return\s+)\s*(?:fn|fct\d*|end_fct|init|hook|callback|onfct|atfct|cxafct|xargs|proc|dfault)\s*\("),
+]
+
+
 def parse_loc(loc: str):
     parts = loc.rsplit(":", 2)
     if len(parts) < 2:
-        return None, None
-    return parts[0], int(parts[1])
+        return None, None, None
+    column = None
+    if len(parts) == 3:
+        try:
+            column = int(parts[2])
+        except ValueError:
+            column = None
+    return parts[0], int(parts[1]), column
 
 
 def normalize_path(path: str):
@@ -59,6 +81,63 @@ def read_line(rel_path: str, line_no: int):
     return "UNKNOWN_CALL"
 
 
+def indirect_call_score(line: str) -> int:
+    text = line.strip()
+    if not text or text.startswith("/*") or text.startswith("*"):
+        return 0
+    if text.startswith(("if ", "if(", "while ", "while(", "for ", "for(")):
+        return 0
+    if any(p.search(text) for p in STRONG_INDIRECT_CALL_PATTERNS):
+        return 100
+    if any(p.search(text) for p in WEAK_INDIRECT_CALL_PATTERNS):
+        return 40
+    return 0
+
+
+def looks_like_indirect_call(line: str) -> bool:
+    return indirect_call_score(line) > 0
+
+
+def read_icall_expr(rel_path: str, line_no: int, column: int | None, target: str):
+    full = resolve_source_path(rel_path)
+    if full is None:
+        return "UNKNOWN_CALL"
+
+    try:
+        lines = full.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return "UNKNOWN_CALL"
+
+    if not (1 <= line_no <= len(lines)):
+        return "UNKNOWN_CALL"
+
+    current = lines[line_no - 1].strip()
+    current_score = indirect_call_score(current)
+    if current_score >= 100:
+        return current
+
+    if target != "unknown":
+        start = max(1, line_no - 6)
+        end = min(len(lines), line_no + 12)
+        best_score = current_score
+        best_candidate = current if current_score else ""
+        for idx in range(start, end + 1):
+            candidate = lines[idx - 1].strip()
+            score = indirect_call_score(candidate)
+            if score > best_score:
+                best_score = score
+                best_candidate = candidate
+        if best_candidate:
+            return best_candidate
+
+    if column:
+        suffix = lines[line_no - 1][max(0, column - 1):].strip()
+        if looks_like_indirect_call(suffix):
+            return suffix
+
+    return current
+
+
 def make_filename(idx: int, func: str, rel_path: str, line_no: int, bb: str, insn: str):
     func_s = sanitize_filename(func)
     path_s = sanitize_filename(rel_path)
@@ -68,10 +147,12 @@ def make_filename(idx: int, func: str, rel_path: str, line_no: int, bb: str, ins
 def generate_script(idx: int, row):
     tu, func, bb, insn, loc, target = row
 
-    loc_path, line_no = parse_loc(loc)
+    loc_path, line_no, column = parse_loc(loc)
     rel_path = normalize_path(loc_path if loc_path else tu)
+    if line_no is None:
+        return
 
-    icall_expr = read_line(rel_path, line_no)
+    icall_expr = read_icall_expr(rel_path, line_no, column, target)
 
     fname = make_filename(idx, func, rel_path, line_no, bb, insn)
     out_path = OUTPUT_DIR / fname

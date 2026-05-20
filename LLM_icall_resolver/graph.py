@@ -12,6 +12,7 @@ from .treesitter_retriever import (
     get_enclosing_function_info,
     get_context_bundle,
     get_reference_jump_candidates,
+    get_provider_context_bundle,
 )
 from .analyzer import llm_analyze_step
 from .trace_store import save_step_artifacts
@@ -65,9 +66,31 @@ def classify_jump_kind(state: ResolverState, next_symbol: str | None) -> tuple[s
     return "speculative", []
 
 
-def summarize_icall_resolution(candidates: list[str], decision_reason: str) -> str:
+FIELD_PROVIDER_PAT = re.compile(
+    r"(::|->|\.|@|:[0-9]+|__gconv_step|SVCXPRT|xp_ops|cl_ops|ah_ops|x_ops)"
+)
+
+
+def looks_like_provider_symbol(symbol: str | None) -> bool:
+    if not symbol:
+        return False
+    return bool(FIELD_PROVIDER_PAT.search(symbol))
+
+
+def summarize_icall_resolution(
+    candidates: list[str],
+    decision_reason: str,
+    explicit_status: str | None = None,
+) -> str:
     if candidates:
         return f"Resolved indirect-call target(s): {', '.join(candidates)}"
+
+    if explicit_status == "not_icall":
+        return "The analyzed expression is not an indirect call."
+    if explicit_status == "unresolved":
+        return "No candidate callees were identified."
+    if explicit_status == "inconclusive":
+        return "Analysis ended without a confident static resolution."
 
     reason = (decision_reason or "").lower()
     if "not an indirect call" in reason or "not a call" in reason:
@@ -75,14 +98,45 @@ def summarize_icall_resolution(candidates: list[str], decision_reason: str) -> s
     return "No candidate callees were identified."
 
 
-def classify_icall_resolution(candidates: list[str], decision_reason: str) -> str:
+def classify_icall_resolution(
+    candidates: list[str],
+    decision_reason: str,
+    explicit_status: str | None = None,
+) -> str:
     if candidates:
         return "resolved"
+
+    if explicit_status in {"unresolved", "not_icall", "inconclusive"}:
+        return explicit_status
 
     reason = (decision_reason or "").lower()
     if "not an indirect call" in reason or "not a call" in reason:
         return "not_icall"
     return "unresolved"
+
+
+def normalize_llm_output(result: dict) -> dict:
+    result = dict(result)
+    result.setdefault("candidate_callees", [])
+    result.setdefault("analysis_summary", "")
+    result.setdefault("evidence", [])
+    result.setdefault("resolved", bool(result["candidate_callees"]))
+
+    if result.get("candidate_callees"):
+        result["resolution_status"] = "resolved"
+    elif result.get("resolution_status") not in {"resolved", "unresolved", "not_icall", "inconclusive"}:
+        result["resolution_status"] = classify_icall_resolution(
+            result["candidate_callees"],
+            result.get("analysis_summary", ""),
+        )
+
+    if result.get("decision") == "fail":
+        result["decision"] = "finish"
+        result["next_symbol"] = None
+        result["resolved"] = False
+        result["candidate_callees"] = []
+        result["resolution_status"] = "inconclusive"
+    return result
 
 
 def select_definition(defs: list[dict], icall_location: str | None) -> dict:
@@ -107,6 +161,29 @@ def select_definition(defs: list[dict], icall_location: str | None) -> dict:
 
 def index_symbol(state: ResolverState) -> ResolverState:
     symbol = state["current_symbol"]
+
+    if looks_like_provider_symbol(symbol):
+        bundle = get_provider_context_bundle(
+            project_root=state["project_root"],
+            symbol=symbol,
+            icall_location=state.get("icall_location"),
+            icall_line=state.get("icall_line"),
+        )
+        chunks = [bundle["primary_block"]]
+        return {
+            "current_path": state.get("icall_location", ""),
+            "current_line": state.get("icall_line") or 1,
+            "current_kind": "provider_context",
+            "current_block": bundle["primary_block"],
+            "current_block_kind": bundle["primary_block_kind"],
+            "retrieved_chunks": chunks,
+            "bootlin_references": [],
+            "observations": [
+                f"using provider-context fallback for non-Bootlin symbol {symbol}",
+                f"provider snippets: {len(bundle.get('provider_contexts', []))}",
+            ],
+            "status": "running",
+        }
 
     if state.get("hop_count", 0) == 0 and state.get("icall_location") and state.get("icall_line"):
         callsite_def = get_enclosing_function_info(
@@ -148,10 +225,25 @@ def index_symbol(state: ResolverState) -> ResolverState:
     refs = ident.get("references", [])
 
     if not defs:
+        bundle = get_provider_context_bundle(
+            project_root=state["project_root"],
+            symbol=symbol,
+            icall_location=state.get("icall_location"),
+            icall_line=state.get("icall_line"),
+        )
         return {
-            "status": "failed",
-            "final_answer": f"definition not found for symbol={symbol}",
-            "observations": [f"Bootlin ident lookup failed for {symbol}"],
+            "current_path": state.get("icall_location", ""),
+            "current_line": state.get("icall_line") or 1,
+            "current_kind": "provider_context",
+            "current_block": bundle["primary_block"],
+            "current_block_kind": bundle["primary_block_kind"],
+            "retrieved_chunks": [bundle["primary_block"]],
+            "bootlin_references": [],
+            "observations": [
+                f"Bootlin ident lookup failed for {symbol}; using provider-context fallback",
+                f"provider snippets: {len(bundle.get('provider_contexts', []))}",
+            ],
+            "status": "running",
         }
 
     d = select_definition(defs, state.get("icall_location"))
@@ -170,9 +262,24 @@ def index_symbol(state: ResolverState) -> ResolverState:
 def retrieve_block(state: ResolverState) -> ResolverState:
     if state.get("hop_count", 0) > state.get("max_hops", 6):
         return {
-            "status": "failed",
-            "final_answer": "max hops exceeded",
+            "status": "resolved",
+            "decision": "finish",
+            "decision_reason": "max hops exceeded before retrieval; inconclusive",
+            "icall_resolution_status": "inconclusive",
+            "icall_resolved": False,
+            "icall_resolution_reason": "Analysis ended without a confident static resolution.",
+            "candidate_callees": [],
+            "icall_targets": [],
             "observations": ["stopped because max_hops was exceeded"],
+        }
+
+    if state.get("current_kind") == "provider_context":
+        return {
+            "current_block": state.get("current_block", ""),
+            "current_block_kind": "provider_context",
+            "retrieved_chunks": [state.get("current_block", "")],
+            "observations": ["provider-context block already prepared"],
+            "status": "running",
         }
 
     if state["current_kind"] not in {
@@ -289,27 +396,36 @@ def expand_reference_candidates(state: ResolverState) -> ResolverState:
 def analyze_with_llm(state: ResolverState) -> ResolverState:
     if state.get("iteration", 0) >= state.get("max_iterations", 10):
         return {
-            "status": "failed",
-            "final_answer": (
+            "status": "resolved",
+            "decision": "finish",
+            "decision_reason": (
                 f"max iterations exceeded: iteration={state.get('iteration', 0)} "
-                f"max_iterations={state.get('max_iterations', 10)}"
+                f"max_iterations={state.get('max_iterations', 10)}; inconclusive"
             ),
+            "icall_resolution_status": "inconclusive",
+            "icall_resolved": False,
+            "icall_resolution_reason": "Analysis ended without a confident static resolution.",
+            "candidate_callees": [],
+            "icall_targets": [],
             "observations": ["stopped before LLM call because max_iterations was reached"],
         }
 
     bundle = llm_analyze_step(state)
-    result = bundle["llm_output"]
+    result = normalize_llm_output(bundle["llm_output"])
 
     iteration = state.get("iteration", 0) + 1
     icall_targets = list(dict.fromkeys(result["candidate_callees"]))
     icall_resolved = bool(icall_targets)
+    explicit_status = result.get("resolution_status")
     icall_resolution_reason = summarize_icall_resolution(
         icall_targets,
         result["analysis_summary"],
+        explicit_status,
     )
     icall_resolution_status = classify_icall_resolution(
         icall_targets,
         result["analysis_summary"],
+        explicit_status,
     )
     jump_kind, grounded_sources = classify_jump_kind(state, result.get("next_symbol"))
     selected_from_reference_candidates = result.get("next_symbol") in {
@@ -385,8 +501,14 @@ def jump_symbol(state: ResolverState) -> ResolverState:
 
     if not next_sym:
         return {
-            "status": "failed",
-            "final_answer": "LLM did not provide next_symbol",
+            "status": "resolved",
+            "decision": "finish",
+            "decision_reason": "LLM did not provide next_symbol; inconclusive",
+            "icall_resolution_status": "inconclusive",
+            "icall_resolved": False,
+            "icall_resolution_reason": "Analysis ended without a confident static resolution.",
+            "candidate_callees": [],
+            "icall_targets": [],
             "observations": ["jump requested but next_symbol was empty"],
         }
 
@@ -398,16 +520,27 @@ def jump_symbol(state: ResolverState) -> ResolverState:
             "decision_reason": (
                 f"Loop detected at {next_sym}. The resolver reached a previously "
                 "visited symbol without new value-flow evidence, so this path is "
-                "classified as unresolved instead of failed."
+                "classified as inconclusive instead of unresolved."
             ),
             "next_symbol": None,
+            "icall_resolution_status": "inconclusive",
+            "icall_resolved": False,
+            "icall_resolution_reason": "Analysis ended without a confident static resolution.",
+            "candidate_callees": [],
+            "icall_targets": [],
             "observations": [f"stopped before revisiting already visited symbol {next_sym}"],
         }
 
     if state.get("hop_count", 0) >= state.get("max_hops", 6):
         return {
-            "status": "failed",
-            "final_answer": "max hops exceeded",
+            "status": "resolved",
+            "decision": "finish",
+            "decision_reason": "max hops exceeded; inconclusive",
+            "icall_resolution_status": "inconclusive",
+            "icall_resolved": False,
+            "icall_resolution_reason": "Analysis ended without a confident static resolution.",
+            "candidate_callees": [],
+            "icall_targets": [],
             "observations": ["stopped before jump because max_hops was reached"],
         }
 
@@ -423,15 +556,21 @@ def jump_symbol(state: ResolverState) -> ResolverState:
 def finish(state: ResolverState) -> ResolverState:
     visited = state.get("visited_symbols", [])
     traces = state.get("visible_trace", [])
-    candidates = list(dict.fromkeys(state.get("candidate_callees", [])))
+    explicit_status = state.get("icall_resolution_status")
+    if explicit_status in {"unresolved", "not_icall", "inconclusive", "failed"}:
+        candidates = []
+    else:
+        candidates = list(dict.fromkeys(state.get("candidate_callees", [])))
     icall_resolved = bool(candidates)
     icall_resolution_reason = summarize_icall_resolution(
         candidates,
         state.get("decision_reason", ""),
+        state.get("icall_resolution_status"),
     )
     icall_resolution_status = classify_icall_resolution(
         candidates,
         state.get("decision_reason", ""),
+        state.get("icall_resolution_status"),
     )
 
     lines = []
@@ -506,6 +645,8 @@ def fail(state: ResolverState) -> ResolverState:
 def route_after_retrieve(state: ResolverState):
     if state.get("status") == "failed":
         return "fail"
+    if state.get("status") == "resolved":
+        return "finish"
     return "expand_reference_candidates"
 
 
@@ -516,7 +657,7 @@ def route_after_llm(state: ResolverState):
         return "finish"
     if decision == "jump":
         return "jump_symbol"
-    return "fail"
+    return "finish"
 
 
 def route_after_jump(state: ResolverState):
@@ -549,6 +690,7 @@ def build_graph():
         route_after_retrieve,
         {
             "expand_reference_candidates": "expand_reference_candidates",
+            "finish": "finish",
             "fail": "fail",
         },
     )

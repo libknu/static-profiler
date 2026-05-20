@@ -31,7 +31,7 @@ class ResolverState(TypedDict, total=False):
 
     retrieved_chunks: Annotated[list[str], operator.add] #analyze with LLM
     observations: Annotated[list[str], operator.add]
-    candidate_callees: Annotated[list[str], operator.add]
+    candidate_callees: list[str]
     visited_symbols: Annotated[list[str], operator.add]
     visible_trace: Annotated[list[dict], operator.add]
 
@@ -45,7 +45,7 @@ class ResolverState(TypedDict, total=False):
     max_iterations: int
 
     status: Literal["running", "resolved", "failed"]
-    icall_resolution_status: Literal["resolved", "unresolved", "not_icall", "failed"]
+    icall_resolution_status: Literal["resolved", "unresolved", "not_icall", "inconclusive", "failed"]
     icall_resolved: bool
     icall_resolution_reason: str
     icall_targets: list[str]

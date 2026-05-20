@@ -21,6 +21,7 @@ from .graph import (
     finish,
     index_symbol,
     jump_symbol,
+    normalize_llm_output,
     summarize_icall_resolution,
     retrieve_block,
 )
@@ -36,7 +37,6 @@ ADD_LIST_FIELDS = {
     "reference_jump_candidates",
     "retrieved_chunks",
     "observations",
-    "candidate_callees",
     "visited_symbols",
     "visible_trace",
 }
@@ -372,6 +372,7 @@ def replay_existing_steps(case: Case) -> None:
         llm_output = step_payload.get("llm_output")
         if not llm_output:
             break
+        llm_output = normalize_llm_output(llm_output)
 
         expected_iteration = case.state.get("iteration", 0) + 1
         if step_payload.get("iteration") != expected_iteration:
@@ -446,9 +447,26 @@ def replay_existing_steps(case: Case) -> None:
                 case.state = merge_state(case.state, fail(case.state))
                 case.done = True
                 save_final_result(case.state["output_dir"], case.state)
+            elif case.state.get("status") == "resolved":
+                case.state = merge_state(case.state, finish(case.state))
+                case.done = True
+                save_final_result(case.state["output_dir"], case.state)
         else:
-            case.state = merge_state(case.state, {"status": "failed", "final_answer": "LLM returned fail decision"})
-            case.state = merge_state(case.state, fail(case.state))
+            case.state = merge_state(
+                case.state,
+                {
+                    "decision": "finish",
+                    "decision_reason": case.state.get(
+                        "decision_reason",
+                        "Analysis ended without a confident static resolution.",
+                    ),
+                    "icall_resolution_status": "inconclusive",
+                    "icall_resolved": False,
+                    "icall_resolution_reason": "Analysis ended without a confident static resolution.",
+                    "status": "resolved",
+                },
+            )
+            case.state = merge_state(case.state, finish(case.state))
             case.done = True
             save_final_result(case.state["output_dir"], case.state)
 
@@ -467,14 +485,20 @@ def run_local_until_llm(case: Case) -> None:
         state = merge_state(
             state,
             {
-                "status": "failed",
-                "final_answer": (
+                "status": "resolved",
+                "decision": "finish",
+                "decision_reason": (
                     f"max iterations exceeded: iteration={state.get('iteration', 0)} "
-                    f"max_iterations={state.get('max_iterations', 10)}"
+                    f"max_iterations={state.get('max_iterations', 10)}; inconclusive"
                 ),
+                "icall_resolution_status": "inconclusive",
+                "icall_resolved": False,
+                "icall_resolution_reason": "Analysis ended without a confident static resolution.",
+                "candidate_callees": [],
+                "icall_targets": [],
             },
         )
-        case.state = merge_state(state, fail(state))
+        case.state = merge_state(state, finish(state))
         save_final_result(case.state["output_dir"], case.state)
         case.done = True
         return
@@ -485,6 +509,11 @@ def run_local_until_llm(case: Case) -> None:
             state = merge_state(state, fail(state))
             case.state = state
             save_final_result(state["output_dir"], state)
+            case.done = True
+            return
+        if state.get("status") == "resolved":
+            case.state = merge_state(state, finish(state))
+            save_final_result(case.state["output_dir"], case.state)
             case.done = True
             return
 
@@ -665,17 +694,21 @@ def extract_llm_output(batch_item: dict[str, Any]) -> dict[str, Any]:
 
 
 def apply_llm_result(case: Case, llm_output: dict[str, Any], prompt_payload: dict[str, Any], prompt_text: str) -> None:
+    llm_output = normalize_llm_output(llm_output)
     state = case.state
     iteration = state.get("iteration", 0) + 1
     icall_targets = list(dict.fromkeys(llm_output["candidate_callees"]))
     icall_resolved = bool(icall_targets)
+    explicit_status = llm_output.get("resolution_status")
     icall_resolution_reason = summarize_icall_resolution(
         icall_targets,
         llm_output["analysis_summary"],
+        explicit_status,
     )
     icall_resolution_status = classify_icall_resolution(
         icall_targets,
         llm_output["analysis_summary"],
+        explicit_status,
     )
     jump_kind, grounded_sources = classify_jump_kind(state, llm_output.get("next_symbol"))
     selected_from_reference_candidates = llm_output.get("next_symbol") in {
@@ -756,9 +789,26 @@ def apply_llm_result(case: Case, llm_output: dict[str, Any], prompt_payload: dic
             state = merge_state(state, fail(state))
             case.done = True
             save_final_result(state["output_dir"], state)
+        elif state.get("status") == "resolved":
+            state = merge_state(state, finish(state))
+            case.done = True
+            save_final_result(state["output_dir"], state)
     else:
-        state = merge_state(state, {"status": "failed", "final_answer": "LLM returned fail decision"})
-        state = merge_state(state, fail(state))
+        state = merge_state(
+            state,
+            {
+                "decision": "finish",
+                "decision_reason": state.get(
+                    "decision_reason",
+                    "Analysis ended without a confident static resolution.",
+                ),
+                "icall_resolution_status": "inconclusive",
+                "icall_resolved": False,
+                "icall_resolution_reason": "Analysis ended without a confident static resolution.",
+                "status": "resolved",
+            },
+        )
+        state = merge_state(state, finish(state))
         case.done = True
         save_final_result(state["output_dir"], state)
 
@@ -808,6 +858,7 @@ def run_all(args: argparse.Namespace) -> None:
         f"pending={status_counts['pending']} done={status_counts['done']} "
         f"resolved={status_counts['icall_resolved']} "
         f"unresolved={status_counts['icall_unresolved']} "
+        f"inconclusive={status_counts['icall_inconclusive']} "
         f"not_icall={status_counts['icall_not_icall']} "
         f"failed={status_counts['icall_failed']}"
     )
@@ -851,6 +902,7 @@ def run_all(args: argparse.Namespace) -> None:
             f"pending={round_status['pending']} done={round_status['done']} "
             f"resolved={round_status['icall_resolved']} "
             f"unresolved={round_status['icall_unresolved']} "
+            f"inconclusive={round_status['icall_inconclusive']} "
             f"not_icall={round_status['icall_not_icall']} "
             f"failed={round_status['icall_failed']}"
         )
@@ -911,6 +963,7 @@ def run_all(args: argparse.Namespace) -> None:
             f"round {round_no}: post-apply pending={round_status['pending']} done={round_status['done']} "
             f"resolved={round_status['icall_resolved']} "
             f"unresolved={round_status['icall_unresolved']} "
+            f"inconclusive={round_status['icall_inconclusive']} "
             f"not_icall={round_status['icall_not_icall']} "
             f"failed={round_status['icall_failed']}"
         )

@@ -861,3 +861,132 @@ def get_initializer_occurrences(
 
     _disk_cache_set("initializer_occurrences", cache_payload, results)
     return results
+
+
+def _symbol_search_terms(symbol: str) -> list[str]:
+    terms: list[str] = []
+    raw = (symbol or "").strip()
+    if raw:
+        terms.append(raw)
+
+    for sep in ("::", "->", "."):
+        if sep in raw:
+            tail = raw.rsplit(sep, 1)[-1].strip()
+            if tail:
+                terms.append(tail)
+
+    if raw.endswith("__fct"):
+        terms.extend(["__fct", "struct __gconv_step"])
+
+    return list(dict.fromkeys(t for t in terms if t))
+
+
+def _line_window(lines: list[str], line_no: int, radius: int = 8) -> tuple[int, str]:
+    start = max(1, line_no - radius)
+    end = min(len(lines), line_no + radius)
+    numbered = [
+        f"{idx}: {lines[idx - 1]}"
+        for idx in range(start, end + 1)
+    ]
+    return start, "\n".join(numbered)
+
+
+def get_provider_context_bundle(
+    project_root: str,
+    symbol: str,
+    icall_location: Optional[str] = None,
+    icall_line: Optional[int] = None,
+    max_results: int = 24,
+) -> dict:
+    cache_payload = {
+        "project_root": project_root,
+        "symbol": symbol,
+        "icall_location": icall_location,
+        "icall_line": icall_line,
+        "max_results": max_results,
+    }
+    cached = _disk_cache_get("provider_context_bundle", cache_payload)
+    if cached is not None:
+        return cached
+
+    terms = _symbol_search_terms(symbol)
+    results: list[dict] = []
+    seen = set()
+
+    preferred_names = {
+        "gconv_int.h",
+        "gconv_db.c",
+        "gconv_builtin.c",
+        "gconv_cache.c",
+        "gconv_conf.c",
+        "skeleton.c",
+    }
+    paths = list(collect_c_family_files(project_root))
+    paths.sort(key=lambda p: (p.name not in preferred_names, str(p)))
+
+    for path in paths:
+        try:
+            lines = read_text_safe(path).splitlines()
+        except Exception:
+            continue
+        text = "\n".join(lines)
+        for term in terms:
+            if term not in text:
+                continue
+            for i, line in enumerate(lines, start=1):
+                if term not in line:
+                    continue
+                key = (str(path), i, term)
+                if key in seen:
+                    continue
+                seen.add(key)
+                start, snippet = _line_window(lines, i)
+                results.append(
+                    {
+                        "kind": "provider_occurrence",
+                        "path": str(path.relative_to(project_root)),
+                        "line": start,
+                        "text": snippet,
+                    }
+                )
+                if len(results) >= max_results:
+                    result = {
+                        "primary_block": _format_provider_context(symbol, results),
+                        "primary_block_kind": "provider_context",
+                        "provider_contexts": results,
+                    }
+                    _disk_cache_set("provider_context_bundle", cache_payload, result)
+                    return result
+
+    if icall_location and icall_line:
+        snippet, _ = get_nearby_source_snippet(
+            project_root=project_root,
+            relative_path=icall_location,
+            line_1_based=icall_line,
+            radius=80,
+        )
+        results.append(
+            {
+                "kind": "callsite_fallback",
+                "path": icall_location,
+                "line": max(1, icall_line - 80),
+                "text": snippet,
+            }
+        )
+
+    result = {
+        "primary_block": _format_provider_context(symbol, results),
+        "primary_block_kind": "provider_context",
+        "provider_contexts": results,
+    }
+    _disk_cache_set("provider_context_bundle", cache_payload, result)
+    return result
+
+
+def _format_provider_context(symbol: str, contexts: list[dict]) -> str:
+    if not contexts:
+        return f"[provider_context] no local provider snippets found for {symbol}"
+    chunks = [f"[provider_context] symbol={symbol}"]
+    for ctx in contexts:
+        chunks.append(f"[{ctx['kind']}] {ctx['path']}:{ctx['line']}\n{ctx['text']}")
+    return "\n\n".join(chunks)
