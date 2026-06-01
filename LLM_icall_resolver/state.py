@@ -7,6 +7,7 @@ class ResolverState(TypedDict, total=False):
     project: str
     version: str
     family: str
+    provider: str
     model: str
 
     caller_symbol: str
@@ -45,7 +46,7 @@ class ResolverState(TypedDict, total=False):
     max_iterations: int
 
     status: Literal["running", "resolved", "failed"]
-    icall_resolution_status: Literal["resolved", "unresolved", "not_icall", "inconclusive", "failed"]
+    icall_resolution_status: Literal["resolved", "unresolved", "not_icall", "failed"]
     icall_resolved: bool
     icall_resolution_reason: str
     icall_targets: list[str]

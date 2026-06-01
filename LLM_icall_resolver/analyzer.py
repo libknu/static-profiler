@@ -1,11 +1,14 @@
 import os
 import json
+import requests
 try:
     from openai import OpenAI
 except ModuleNotFoundError:
     OpenAI = None
 
 DEFAULT_MODEL_NAME = "gpt-5.4"
+DEFAULT_PROVIDER = "openai"
+ANTHROPIC_API_VERSION = "2023-06-01"
 MODEL_NAME = DEFAULT_MODEL_NAME
 
 JSON_SCHEMA = {
@@ -80,6 +83,26 @@ Rules:
 - Do not report ordinary unresolved static-analysis results as failures.
 
 Output MUST be valid JSON following the schema.
+"""
+
+
+ANTHROPIC_SYSTEM_PROMPT = SYSTEM_PROMPT + """
+
+Claude-specific decision policy:
+- Be exploration-oriented before declaring unresolved.
+- If reference-derived jump candidates are provided and the current context does
+  not directly resolve the callee, choose decision="jump" to the most relevant
+  grounded function-level candidate.
+- If the current context shows a function-pointer field, typedef, macro wrapper,
+  ops table, or callback slot but no concrete assignment, do not finish as
+  unresolved until you have followed at least one grounded setup/caller/provider
+  candidate when one is available.
+- Do not use a typedef, struct name, field name, or function-pointer type as a
+  candidate callee. candidate_callees must be concrete callable function symbols.
+- Finish with resolution_status="unresolved" only when no grounded next_symbol is
+  available or when the evidence shows the target is inherently runtime-selected.
+- Prefer jump over finish when the only reason for unresolved is "assignment not
+  visible in the current context".
 """
 
 #- Only use identifiers that actually appear in the provided context unless you are making a necessary speculative provider/helper inference.
@@ -175,36 +198,116 @@ Previous observations:
 """
 
 
-def llm_analyze_step(state: dict) -> dict:
-    if OpenAI is None:
-        raise RuntimeError("openai package is required for llm_analyze_step")
+def normalize_provider(provider: str | None, model: str | None = None) -> str:
+    provider = (provider or "").strip().lower()
+    if provider:
+        return provider
+    if model and model.startswith("claude-"):
+        return "anthropic"
+    return DEFAULT_PROVIDER
 
-    prompt_payload = build_step_prompt_payload(state)
-    prompt_text = render_step_prompt(prompt_payload)
-    model = state.get("model") or DEFAULT_MODEL_NAME
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
+def build_openai_chat_body(model: str, prompt_text: str) -> dict:
+    return {
+        "model": model,
+        "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt_text},
         ],
-        response_format={
+        "response_format": {
             "type": "json_schema",
             "json_schema": {
                 "name": "resolver_decision",
                 "schema": JSON_SCHEMA
             }
         },
-        temperature=0.0,
-    )
+        "temperature": 0.0,
+    }
 
-    data = json.loads(resp.choices[0].message.content)
+
+def system_prompt_for_provider(provider: str | None, model: str | None = None) -> str:
+    provider = normalize_provider(provider, model)
+    if provider == "anthropic":
+        return ANTHROPIC_SYSTEM_PROMPT
+    return SYSTEM_PROMPT
+
+
+def build_anthropic_messages_body(model: str, prompt_text: str) -> dict:
+    return {
+        "model": model,
+        "max_tokens": 4096,
+        "system": ANTHROPIC_SYSTEM_PROMPT,
+        "messages": [
+            {"role": "user", "content": prompt_text},
+        ],
+        "tools": [
+            {
+                "name": "resolver_decision",
+                "description": "Return the indirect-call resolver decision.",
+                "input_schema": JSON_SCHEMA,
+            }
+        ],
+        "tool_choice": {"type": "tool", "name": "resolver_decision"},
+        "temperature": 0.0,
+    }
+
+
+def extract_anthropic_tool_input(message: dict) -> dict:
+    for block in message.get("content", []):
+        if block.get("type") == "tool_use" and block.get("name") == "resolver_decision":
+            tool_input = block.get("input")
+            if isinstance(tool_input, dict):
+                return tool_input
+            raise ValueError(f"Anthropic tool input was not an object: {tool_input!r}")
+    raise ValueError(f"Anthropic response did not contain resolver_decision tool_use: {message}")
+
+
+def call_openai(model: str, prompt_text: str) -> dict:
+    if OpenAI is None:
+        raise RuntimeError("openai package is required for provider=openai")
+
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    resp = client.chat.completions.create(**build_openai_chat_body(model, prompt_text))
+    return json.loads(resp.choices[0].message.content)
+
+
+def call_anthropic(model: str, prompt_text: str) -> dict:
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY is required for provider=anthropic")
+
+    response = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": ANTHROPIC_API_VERSION,
+            "content-type": "application/json",
+        },
+        json=build_anthropic_messages_body(model, prompt_text),
+        timeout=120,
+    )
+    response.raise_for_status()
+    return extract_anthropic_tool_input(response.json())
+
+
+def llm_analyze_step(state: dict) -> dict:
+    prompt_payload = build_step_prompt_payload(state)
+    prompt_text = render_step_prompt(prompt_payload)
+    model = state.get("model") or DEFAULT_MODEL_NAME
+    provider = normalize_provider(state.get("provider"), model)
+
+    if provider == "openai":
+        data = call_openai(model, prompt_text)
+    elif provider == "anthropic":
+        data = call_anthropic(model, prompt_text)
+    else:
+        raise ValueError(f"unsupported provider: {provider}")
 
     return {
+        "provider": provider,
         "model": model,
         "prompt_payload": prompt_payload,
         "prompt_text": prompt_text,
+        "system_prompt": system_prompt_for_provider(provider, model),
         "llm_output": data,
     }

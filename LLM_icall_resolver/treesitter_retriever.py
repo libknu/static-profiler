@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import threading
 
 import tree_sitter_c as tsc
@@ -76,6 +77,18 @@ def read_text_safe(path: Path) -> str:
 @lru_cache(maxsize=4096)
 def read_bytes_safe(path: Path) -> bytes:
     return path.read_bytes()
+
+
+@lru_cache(maxsize=4096)
+def _parse_tree_cached(path_text: str, mtime_ns: int, size: int):
+    source = read_bytes_safe(Path(path_text))
+    parser = build_parser()
+    return parser.parse(source)
+
+
+def parse_tree_safe(path: Path):
+    stat = path.stat()
+    return _parse_tree_cached(str(path), stat.st_mtime_ns, stat.st_size)
 
 
 def node_text(node: Node, source: bytes) -> str:
@@ -154,9 +167,7 @@ def get_function_source(
 
     file_path = Path(project_root) / relative_path
     source = read_bytes_safe(file_path)
-
-    parser = build_parser()
-    tree = parser.parse(source)
+    tree = parse_tree_safe(file_path)
 
     fn_node = find_function_definition_by_name_and_line(
         tree.root_node, source, symbol, line_1_based
@@ -216,6 +227,46 @@ def collect_c_family_files(project_root: str) -> tuple[Path, ...]:
     root = Path(project_root)
     exts = {".c", ".h", ".hpp", ".hh", ".cc"}
     return tuple(p for p in root.rglob("*") if p.is_file() and p.suffix in exts)
+
+
+@lru_cache(maxsize=4096)
+def find_c_family_files_containing(project_root: str, terms: tuple[str, ...]) -> tuple[Path, ...]:
+    root = Path(project_root)
+    clean_terms = tuple(dict.fromkeys(t for t in terms if t))
+    if not clean_terms:
+        return ()
+
+    pattern = "|".join(rf"\b{re.escape(term)}\b" for term in clean_terms)
+    try:
+        proc = subprocess.run(
+            [
+                "rg",
+                "--files-with-matches",
+                "--glob",
+                "*.{c,h,cc,hh,hpp}",
+                pattern,
+                str(root),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        return collect_c_family_files(project_root)
+
+    if proc.returncode == 1:
+        return ()
+    if proc.returncode != 0:
+        return collect_c_family_files(project_root)
+
+    paths = []
+    for line in proc.stdout.splitlines():
+        path = Path(line)
+        if path.is_file():
+            paths.append(path)
+    return tuple(paths)
 
 
 def get_macro_definitions(
@@ -307,10 +358,9 @@ def get_struct_definitions_for_field(
     results: list[dict] = []
     field_pat = re.compile(rf"\b{re.escape(field_name)}\b")
 
-    for path in collect_c_family_files(project_root):
+    for path in find_c_family_files_containing(project_root, (field_name,)):
         source = read_bytes_safe(path)
-        parser = build_parser()
-        tree = parser.parse(source)
+        tree = parse_tree_safe(path)
 
         for node in iter_nodes(tree.root_node):
             if node.type not in {"struct_specifier", "union_specifier"}:
@@ -451,8 +501,7 @@ def get_callsite_context(
         return ""
 
     source = read_bytes_safe(file_path)
-    parser = build_parser()
-    tree = parser.parse(source)
+    tree = parse_tree_safe(file_path)
     fn = find_enclosing_function_by_line(tree.root_node, source, line_1_based)
     if fn is not None:
         text = node_text(fn, source)
@@ -486,8 +535,7 @@ def get_enclosing_function_info(
         return None
 
     source = read_bytes_safe(file_path)
-    parser = build_parser()
-    tree = parser.parse(source)
+    tree = parse_tree_safe(file_path)
     fn = find_enclosing_function_by_line(tree.root_node, source, line_1_based)
     if fn is None:
         return None
@@ -690,9 +738,7 @@ def get_global_symbol_source(
 
     file_path = Path(project_root) / relative_path
     source = read_bytes_safe(file_path)
-
-    parser = build_parser()
-    tree = parser.parse(source)
+    tree = parse_tree_safe(file_path)
 
     decl_node = find_declaration_by_name_and_line(
         tree.root_node, source, symbol, line_1_based
@@ -780,8 +826,7 @@ def get_reference_jump_candidates(
             continue
 
         source = read_bytes_safe(file_path)
-        parser = build_parser()
-        tree = parser.parse(source)
+        tree = parse_tree_safe(file_path)
 
         for line_no in parse_bootlin_line_field(ref.get("line")):
             fn = find_enclosing_function_by_line(tree.root_node, source, line_no)
@@ -831,10 +876,9 @@ def get_initializer_occurrences(
     if not identifiers:
         return results
 
-    for path in collect_c_family_files(project_root):
+    for path in find_c_family_files_containing(project_root, tuple(identifiers)):
         source = read_bytes_safe(path)
-        parser = build_parser()
-        tree = parser.parse(source)
+        tree = parse_tree_safe(path)
 
         for node in iter_nodes(tree.root_node):
             if node.type not in {"declaration", "init_declarator"}:

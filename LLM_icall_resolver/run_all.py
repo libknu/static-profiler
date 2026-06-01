@@ -1,18 +1,32 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import time
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .analyzer import DEFAULT_MODEL_NAME, JSON_SCHEMA, SYSTEM_PROMPT, build_step_prompt_payload, render_step_prompt
+from .analyzer import (
+    ANTHROPIC_API_VERSION,
+    DEFAULT_MODEL_NAME,
+    DEFAULT_PROVIDER,
+    build_anthropic_messages_body,
+    build_openai_chat_body,
+    extract_anthropic_tool_input,
+    normalize_provider,
+    system_prompt_for_provider,
+    build_step_prompt_payload,
+    render_step_prompt,
+)
 from .graph import (
     classify_icall_resolution,
     classify_jump_kind,
@@ -22,6 +36,7 @@ from .graph import (
     index_symbol,
     jump_symbol,
     normalize_llm_output,
+    preclassify_icall,
     summarize_icall_resolution,
     retrieve_block,
 )
@@ -78,6 +93,7 @@ def parse_input_script(path: Path, workspace_root: Path, project_root: Path) -> 
         "project": "glibc",
         "version": "glibc-2.41",
         "family": "C",
+        "provider": DEFAULT_PROVIDER,
         "model": DEFAULT_MODEL_NAME,
         "caller_symbol": None,
         "icall_expr": None,
@@ -114,7 +130,11 @@ def parse_input_script(path: Path, workspace_root: Path, project_root: Path) -> 
             values[key] = value
         i += 2
 
-    missing = [key for key in ("caller_symbol", "icall_expr", "icall_location") if not values[key]]
+    values["provider"] = normalize_provider(values.get("provider"), values.get("model"))
+
+    if values.get("icall_expr") is None:
+        values["icall_expr"] = ""
+    missing = [key for key in ("caller_symbol", "icall_location") if not values[key]]
     if missing:
         raise ValueError(f"missing required arguments in {path.name}: {', '.join(missing)}")
 
@@ -135,6 +155,11 @@ def make_args(values: dict[str, Any]):
     return argparse.Namespace(**values)
 
 
+def normalize_case_name(name: str) -> str:
+    name = name.strip().removeprefix("old.")
+    return re.sub(r"\.\d+$", "", name)
+
+
 def load_case_names(case_file: Path | None) -> set[str] | None:
     if case_file is None:
         return None
@@ -143,7 +168,7 @@ def load_case_names(case_file: Path | None) -> set[str] | None:
         text = line.strip()
         if not text or text.startswith("#"):
             continue
-        names.add(text.split(",", 1)[0].strip())
+        names.add(normalize_case_name(text.split(",", 1)[0].strip()))
     return names
 
 
@@ -238,6 +263,7 @@ def initialize_cases(
     skip_resolved: bool,
     archive_existing: bool,
     case_names: set[str] | None,
+    provider: str,
     model: str,
     max_iterations: int,
 ) -> list[Case]:
@@ -268,6 +294,7 @@ def initialize_cases(
                 "project": "glibc",
                 "version": "glibc-2.41",
                 "family": "C",
+                "provider": normalize_provider(provider, model),
                 "model": model,
                 "caller_symbol": "",
                 "icall_expr": "",
@@ -313,6 +340,7 @@ def initialize_cases(
             continue
 
         values["model"] = model
+        values["provider"] = normalize_provider(provider, model)
         values["max_iterations"] = max_iterations
         run_name = sanitize_name(values["run_name"])
         if case_names is not None and run_name not in case_names:
@@ -460,7 +488,7 @@ def replay_existing_steps(case: Case) -> None:
                         "decision_reason",
                         "Analysis ended without a confident static resolution.",
                     ),
-                    "icall_resolution_status": "inconclusive",
+                    "icall_resolution_status": "unresolved",
                     "icall_resolved": False,
                     "icall_resolution_reason": "Analysis ended without a confident static resolution.",
                     "status": "resolved",
@@ -489,9 +517,9 @@ def run_local_until_llm(case: Case) -> None:
                 "decision": "finish",
                 "decision_reason": (
                     f"max iterations exceeded: iteration={state.get('iteration', 0)} "
-                    f"max_iterations={state.get('max_iterations', 10)}; inconclusive"
+                    f"max_iterations={state.get('max_iterations', 10)}; unresolved"
                 ),
-                "icall_resolution_status": "inconclusive",
+                "icall_resolution_status": "unresolved",
                 "icall_resolved": False,
                 "icall_resolution_reason": "Analysis ended without a confident static resolution.",
                 "candidate_callees": [],
@@ -503,7 +531,12 @@ def run_local_until_llm(case: Case) -> None:
         case.done = True
         return
 
-    for node in (index_symbol, retrieve_block):
+    local_nodes = []
+    if state.get("hop_count", 0) == 0 and state.get("iteration", 0) == 0:
+        local_nodes.append(preclassify_icall)
+    local_nodes.extend([index_symbol, retrieve_block])
+
+    for node in local_nodes:
         state = merge_state(state, node(state))
         if state.get("status") == "failed":
             state = merge_state(state, fail(state))
@@ -580,35 +613,32 @@ def run_local_until_llm_many(cases: list[Case], workers: int) -> None:
 def build_batch_request(case: Case) -> tuple[str, dict[str, Any], str, str]:
     state = case.state
     model = state.get("model") or DEFAULT_MODEL_NAME
+    provider = normalize_provider(state.get("provider"), model)
     iteration = state.get("iteration", 0) + 1
     custom_id = f"{case.run_name}::step{iteration}"
     prompt_payload = build_step_prompt_payload(state)
     prompt_text = render_step_prompt(prompt_payload)
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt_text},
-        ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "resolver_decision",
-                "schema": JSON_SCHEMA,
-            },
-        },
-        "temperature": 0.0,
-    }
-    request = {
-        "custom_id": custom_id,
-        "method": "POST",
-        "url": "/v1/chat/completions",
-        "body": body,
-    }
+
+    if provider == "openai":
+        request = {
+            "custom_id": custom_id,
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": build_openai_chat_body(model, prompt_text),
+        }
+    elif provider == "anthropic":
+        digest = hashlib.sha256(custom_id.encode("utf-8")).hexdigest()[:24]
+        custom_id = f"case_{digest}_s{iteration}"
+        request = {
+            "custom_id": custom_id,
+            "params": build_anthropic_messages_body(model, prompt_text),
+        }
+    else:
+        raise ValueError(f"unsupported provider: {provider}")
     return custom_id, request, prompt_text, prompt_payload
 
 
-def submit_batch(client: OpenAI, batch_dir: Path, requests: list[dict[str, Any]], round_no: int):
+def submit_openai_batch(client: OpenAI, batch_dir: Path, requests: list[dict[str, Any]], round_no: int):
     batch_dir.mkdir(parents=True, exist_ok=True)
     input_path = write_batch_input(batch_dir=batch_dir, requests=requests, round_no=round_no)
 
@@ -625,6 +655,39 @@ def submit_batch(client: OpenAI, batch_dir: Path, requests: list[dict[str, Any]]
     return batch, input_path
 
 
+def anthropic_headers() -> dict[str, str]:
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY is required for provider=anthropic")
+    return {
+        "x-api-key": api_key,
+        "anthropic-version": ANTHROPIC_API_VERSION,
+        "content-type": "application/json",
+    }
+
+
+def submit_anthropic_batch(batch_dir: Path, requests: list[dict[str, Any]], round_no: int):
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    input_path = write_batch_input(batch_dir=batch_dir, requests=requests, round_no=round_no)
+    response = requests_post_json(
+        "https://api.anthropic.com/v1/messages/batches",
+        json_payload={"requests": requests},
+    )
+    write_json(batch_dir / f"round{round_no:03d}_batch.json", response)
+    return response, input_path
+
+
+def requests_post_json(url: str, json_payload: dict[str, Any]) -> dict[str, Any]:
+    response = requests.post(
+        url,
+        headers=anthropic_headers(),
+        json=json_payload,
+        timeout=120,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 def write_batch_input(batch_dir: Path, requests: list[dict[str, Any]], round_no: int) -> Path:
     batch_dir.mkdir(parents=True, exist_ok=True)
     input_path = batch_dir / f"round{round_no:03d}_input.jsonl"
@@ -634,7 +697,7 @@ def write_batch_input(batch_dir: Path, requests: list[dict[str, Any]], round_no:
     return input_path
 
 
-def wait_for_batch(client: OpenAI, batch_id: str, poll_seconds: int):
+def wait_for_openai_batch(client: OpenAI, batch_id: str, poll_seconds: int):
     terminal = {"completed", "failed", "expired", "cancelled"}
     while True:
         batch = client.batches.retrieve(batch_id)
@@ -645,6 +708,28 @@ def wait_for_batch(client: OpenAI, batch_id: str, poll_seconds: int):
             flush=True,
         )
         if batch.status in terminal:
+            return batch
+        time.sleep(poll_seconds)
+
+
+def wait_for_anthropic_batch(batch_id: str, poll_seconds: int) -> dict[str, Any]:
+    while True:
+        response = requests.get(
+            f"https://api.anthropic.com/v1/messages/batches/{batch_id}",
+            headers=anthropic_headers(),
+            timeout=120,
+        )
+        response.raise_for_status()
+        batch = response.json()
+        counts = batch.get("request_counts") or {}
+        print(
+            f"batch={batch.get('id')} status={batch.get('processing_status')} "
+            f"succeeded={counts.get('succeeded', 0)} "
+            f"errored={counts.get('errored', 0)} "
+            f"processing={counts.get('processing', 0)}",
+            flush=True,
+        )
+        if batch.get("processing_status") == "ended":
             return batch
         time.sleep(poll_seconds)
 
@@ -661,7 +746,7 @@ def response_text(file_response: Any) -> str:
     return str(file_response)
 
 
-def fetch_batch_outputs(client: OpenAI, batch: Any, batch_dir: Path, round_no: int) -> dict[str, dict[str, Any]]:
+def fetch_openai_batch_outputs(client: OpenAI, batch: Any, batch_dir: Path, round_no: int) -> dict[str, dict[str, Any]]:
     if batch.status != "completed":
         raise RuntimeError(f"batch did not complete: {batch.id} status={batch.status}")
     if not batch.output_file_id:
@@ -680,7 +765,33 @@ def fetch_batch_outputs(client: OpenAI, batch: Any, batch_dir: Path, round_no: i
     return outputs
 
 
-def extract_llm_output(batch_item: dict[str, Any]) -> dict[str, Any]:
+def fetch_anthropic_batch_outputs(batch: dict[str, Any], batch_dir: Path, round_no: int) -> dict[str, dict[str, Any]]:
+    if batch.get("processing_status") != "ended":
+        raise RuntimeError(f"batch did not end: {batch.get('id')} status={batch.get('processing_status')}")
+    results_url = batch.get("results_url")
+    if not results_url:
+        raise RuntimeError(f"batch ended without results_url: {batch.get('id')}")
+
+    response = requests.get(
+        results_url,
+        headers=anthropic_headers(),
+        timeout=120,
+    )
+    response.raise_for_status()
+    content = response.text
+    output_path = batch_dir / f"round{round_no:03d}_output.jsonl"
+    output_path.write_text(content, encoding="utf-8")
+
+    outputs: dict[str, dict[str, Any]] = {}
+    for line in content.splitlines():
+        if not line.strip():
+            continue
+        item = json.loads(line)
+        outputs[item["custom_id"]] = item
+    return outputs
+
+
+def extract_openai_llm_output(batch_item: dict[str, Any]) -> dict[str, Any]:
     error = batch_item.get("error")
     if error:
         raise RuntimeError(error)
@@ -691,6 +802,15 @@ def extract_llm_output(batch_item: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(f"missing choices in batch response: {batch_item}")
     content = choices[0]["message"]["content"]
     return json.loads(content)
+
+
+def extract_anthropic_llm_output(batch_item: dict[str, Any]) -> dict[str, Any]:
+    result = batch_item.get("result") or {}
+    result_type = result.get("type")
+    if result_type != "succeeded":
+        raise RuntimeError(result)
+    message = result.get("message") or {}
+    return extract_anthropic_tool_input(message)
 
 
 def apply_llm_result(case: Case, llm_output: dict[str, Any], prompt_payload: dict[str, Any], prompt_text: str) -> None:
@@ -737,7 +857,9 @@ def apply_llm_result(case: Case, llm_output: dict[str, Any], prompt_payload: dic
         prompt_text=prompt_text,
         response_payload={
             "iteration": iteration,
+            "provider": normalize_provider(state.get("provider"), state.get("model")),
             "model": state.get("model") or DEFAULT_MODEL_NAME,
+            "system_prompt": system_prompt_for_provider(state.get("provider"), state.get("model")),
             "icall_resolved": icall_resolved,
             "icall_resolution_status": icall_resolution_status,
             "icall_resolution_reason": icall_resolution_reason,
@@ -802,7 +924,7 @@ def apply_llm_result(case: Case, llm_output: dict[str, Any], prompt_payload: dic
                     "decision_reason",
                     "Analysis ended without a confident static resolution.",
                 ),
-                "icall_resolution_status": "inconclusive",
+                "icall_resolution_status": "unresolved",
                 "icall_resolved": False,
                 "icall_resolution_reason": "Analysis ended without a confident static resolution.",
                 "status": "resolved",
@@ -824,6 +946,7 @@ def mark_batch_error(case: Case, error: str) -> None:
 
 
 def run_all(args: argparse.Namespace) -> None:
+    args.provider = normalize_provider(args.provider, args.model)
     workspace_root = args.workspace_root.expanduser().resolve()
     project_root = args.project_root.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
@@ -844,6 +967,7 @@ def run_all(args: argparse.Namespace) -> None:
         skip_resolved=args.rerun_unresolved,
         archive_existing=args.rerun_unresolved and not args.overwrite,
         case_names=case_names,
+        provider=args.provider,
         model=args.model,
         max_iterations=args.max_iterations,
     )
@@ -875,12 +999,18 @@ def run_all(args: argparse.Namespace) -> None:
         print(f"requests: {len(requests)}")
         return
 
-    try:
-        from openai import OpenAI
-    except ModuleNotFoundError as exc:
-        raise SystemExit("openai package is required to submit Batch API jobs") from exc
-
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    client = None
+    if args.provider == "openai":
+        try:
+            from openai import OpenAI
+        except ModuleNotFoundError as exc:
+            raise SystemExit("openai package is required to submit Batch API jobs") from exc
+        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    elif args.provider == "anthropic":
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise SystemExit("ANTHROPIC_API_KEY is required for provider=anthropic")
+    else:
+        raise SystemExit(f"unsupported provider: {args.provider}")
 
     round_no = 1
     while True:
@@ -921,14 +1051,23 @@ def run_all(args: argparse.Namespace) -> None:
             requests.append(request)
             request_context[custom_id] = (case, prompt_payload, prompt_text)
 
-        batch, input_path = submit_batch(
-            client=client,
-            batch_dir=batch_dir,
-            requests=requests,
-            round_no=round_no,
-        )
+        if args.provider == "openai":
+            batch, input_path = submit_openai_batch(
+                client=client,
+                batch_dir=batch_dir,
+                requests=requests,
+                round_no=round_no,
+            )
+            batch_id = batch.id
+        else:
+            batch, input_path = submit_anthropic_batch(
+                batch_dir=batch_dir,
+                requests=requests,
+                round_no=round_no,
+            )
+            batch_id = batch["id"]
         print(
-            f"submitted round {round_no}: batch={batch.id} "
+            f"submitted round {round_no}: provider={args.provider} batch={batch_id} "
             f"requests={len(requests)} input={input_path}"
         )
 
@@ -936,15 +1075,31 @@ def run_all(args: argparse.Namespace) -> None:
             print("submit-only mode: stopping after first batch submission")
             return
 
-        batch = wait_for_batch(client, batch.id, args.poll_seconds)
-        outputs = fetch_batch_outputs(client, batch, batch_dir=batch_dir, round_no=round_no)
+        if args.provider == "openai":
+            batch = wait_for_openai_batch(client, batch_id, args.poll_seconds)
+            outputs = fetch_openai_batch_outputs(client, batch, batch_dir=batch_dir, round_no=round_no)
+            batch_status = batch.status
+            output_file = batch.output_file_id
+            counts = batch.request_counts
+            completed = getattr(counts, "completed", 0) if counts else 0
+            failed = getattr(counts, "failed", 0) if counts else 0
+            total = getattr(counts, "total", 0) if counts else 0
+        else:
+            batch = wait_for_anthropic_batch(batch_id, args.poll_seconds)
+            outputs = fetch_anthropic_batch_outputs(batch, batch_dir=batch_dir, round_no=round_no)
+            batch_status = batch.get("processing_status")
+            output_file = batch.get("results_url")
+            counts = batch.get("request_counts") or {}
+            completed = counts.get("succeeded", 0)
+            failed = counts.get("errored", 0) + counts.get("canceled", 0) + counts.get("expired", 0)
+            total = sum(counts.values())
         print(
-            f"round {round_no}: batch completed status={batch.status} "
-            f"output_file={batch.output_file_id} "
+            f"round {round_no}: batch completed status={batch_status} "
+            f"output_file={output_file} "
             f"request_counts="
-            f"completed={getattr(batch.request_counts, 'completed', 0) if batch.request_counts else 0}, "
-            f"failed={getattr(batch.request_counts, 'failed', 0) if batch.request_counts else 0}, "
-            f"total={getattr(batch.request_counts, 'total', 0) if batch.request_counts else 0}"
+            f"completed={completed}, "
+            f"failed={failed}, "
+            f"total={total}"
         )
 
         for custom_id, (case, prompt_payload, prompt_text) in request_context.items():
@@ -953,7 +1108,10 @@ def run_all(args: argparse.Namespace) -> None:
                 mark_batch_error(case, f"missing batch output for {custom_id}")
                 continue
             try:
-                llm_output = extract_llm_output(item)
+                if args.provider == "openai":
+                    llm_output = extract_openai_llm_output(item)
+                else:
+                    llm_output = extract_anthropic_llm_output(item)
                 apply_llm_result(case, llm_output, prompt_payload, prompt_text)
             except Exception as exc:
                 mark_batch_error(case, f"batch response processing failed for {custom_id}: {exc}")
@@ -983,6 +1141,11 @@ def main() -> None:
     parser.add_argument("--batch-dir", type=Path, default=Path("outputs/_batches"))
     parser.add_argument("--workspace-root", type=Path, default=Path("~/workspace"))
     parser.add_argument("--project-root", type=Path, default=Path("~/workspace/glibc-src/glibc-2.41"))
+    parser.add_argument(
+        "--provider",
+        choices=["openai", "anthropic"],
+        default=os.environ.get("LLM_ICALL_PROVIDER"),
+    )
     parser.add_argument("--model", default=os.environ.get("LLM_ICALL_MODEL", DEFAULT_MODEL_NAME))
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--poll-seconds", type=int, default=60)

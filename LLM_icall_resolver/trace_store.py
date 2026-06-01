@@ -86,6 +86,7 @@ def order_final_result(result: dict) -> dict:
         "project",
         "version",
         "family",
+        "provider",
         "model",
         "caller_symbol",
         "icall_expr",

@@ -1,4 +1,6 @@
 import re
+from pathlib import Path
+import subprocess
 
 try:
     from langgraph.graph import StateGraph, START, END
@@ -16,6 +18,7 @@ from .treesitter_retriever import (
 )
 from .analyzer import llm_analyze_step
 from .trace_store import save_step_artifacts
+from .deterministic import classify_deterministically, prepare_callsite_inputs
 
 
 IDENT_PAT = re.compile(r"\b[A-Za-z_]\w*\b")
@@ -30,6 +33,84 @@ def _extract_symbols_from_context_list(items: list[str]) -> set[str]:
     for item in items or []:
         out.update(_extract_symbols(item))
     return out
+
+
+def find_local_symbol_references(
+    project_root: str,
+    symbol: str,
+    definition_path: str | None = None,
+    definition_line: int | None = None,
+    max_results: int = 20,
+) -> list[dict]:
+    root = Path(project_root)
+    if not root.is_dir():
+        return []
+
+    refs = []
+    pat = re.compile(rf"\b{re.escape(symbol)}\b")
+    exts = {".c", ".h", ".cc", ".hh", ".hpp"}
+
+    def scan_file(path: Path) -> bool:
+        rel = path.relative_to(root).as_posix()
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            return False
+
+        for line_no, line in enumerate(lines, start=1):
+            if rel == definition_path and definition_line and abs(line_no - definition_line) <= 1:
+                continue
+            if not pat.search(line):
+                continue
+            refs.append({"path": rel, "line": str(line_no), "type": "local_reference"})
+            if len(refs) >= max_results:
+                return True
+        return False
+
+    if definition_path:
+        primary = root / definition_path
+        if primary.is_file():
+            scan_file(primary)
+            if refs:
+                return refs
+
+    try:
+        proc = subprocess.run(
+            [
+                "rg",
+                "--line-number",
+                "--no-heading",
+                "--glob",
+                "*.{c,h,cc,hh,hpp}",
+                rf"\b{re.escape(symbol)}\b",
+                str(root),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        return refs
+
+    for raw in proc.stdout.splitlines():
+        parts = raw.split(":", 2)
+        if len(parts) < 2:
+            continue
+        path_text, line_text = parts[:2]
+        try:
+            path = Path(path_text)
+            line_no = int(line_text)
+            rel = path.relative_to(root).as_posix()
+        except Exception:
+            continue
+        if rel == definition_path and definition_line and abs(line_no - definition_line) <= 1:
+            continue
+        refs.append({"path": rel, "line": str(line_no), "type": "local_reference"})
+        if len(refs) >= max_results:
+            return refs
+    return refs
 
 
 def classify_jump_kind(state: ResolverState, next_symbol: str | None) -> tuple[str | None, list[str]]:
@@ -88,9 +169,9 @@ def summarize_icall_resolution(
     if explicit_status == "not_icall":
         return "The analyzed expression is not an indirect call."
     if explicit_status == "unresolved":
+        if decision_reason:
+            return decision_reason
         return "No candidate callees were identified."
-    if explicit_status == "inconclusive":
-        return "Analysis ended without a confident static resolution."
 
     reason = (decision_reason or "").lower()
     if "not an indirect call" in reason or "not a call" in reason:
@@ -106,7 +187,7 @@ def classify_icall_resolution(
     if candidates:
         return "resolved"
 
-    if explicit_status in {"unresolved", "not_icall", "inconclusive"}:
+    if explicit_status in {"unresolved", "not_icall"}:
         return explicit_status
 
     reason = (decision_reason or "").lower()
@@ -124,7 +205,7 @@ def normalize_llm_output(result: dict) -> dict:
 
     if result.get("candidate_callees"):
         result["resolution_status"] = "resolved"
-    elif result.get("resolution_status") not in {"resolved", "unresolved", "not_icall", "inconclusive"}:
+    elif result.get("resolution_status") not in {"resolved", "unresolved", "not_icall"}:
         result["resolution_status"] = classify_icall_resolution(
             result["candidate_callees"],
             result.get("analysis_summary", ""),
@@ -135,7 +216,7 @@ def normalize_llm_output(result: dict) -> dict:
         result["next_symbol"] = None
         result["resolved"] = False
         result["candidate_callees"] = []
-        result["resolution_status"] = "inconclusive"
+        result["resolution_status"] = "unresolved"
     return result
 
 
@@ -157,6 +238,63 @@ def select_definition(defs: list[dict], icall_location: str | None) -> dict:
                 return d
 
     return defs[0]
+
+
+def preclassify_icall(state: ResolverState) -> ResolverState:
+    updates = prepare_callsite_inputs(state)
+    normalized_state = dict(state)
+    normalized_state.update({k: v for k, v in updates.items() if k != "observations"})
+
+    result = classify_deterministically(normalized_state)
+    if result is None:
+        if updates:
+            updates.setdefault("status", "running")
+            return updates
+        return {"status": "running"}
+
+    iteration = state.get("iteration", 0) + 1
+    candidates = list(dict.fromkeys(result.get("candidate_callees", [])))
+    resolution_status = result.get("resolution_status", "unresolved")
+    resolved = resolution_status == "resolved" and bool(candidates)
+    reason = summarize_icall_resolution(
+        candidates,
+        result.get("analysis_summary", ""),
+        resolution_status,
+    )
+
+    evidence = result.get("evidence", [])
+    observations = list(updates.get("observations", []))
+    observations.extend(evidence)
+    trace_item = {
+        "iteration": iteration,
+        "step": state.get("hop_count", 0),
+        "focus_symbol": state.get("current_symbol"),
+        "decision": "finish",
+        "next_symbol": None,
+        "summary": result.get("analysis_summary", ""),
+        "evidence": evidence,
+        "candidate_callees": candidates,
+        "resolved": resolved,
+        "jump_kind": "deterministic",
+        "grounded_sources": ["preclassify_icall"],
+        "selected_from_reference_candidates": False,
+    }
+
+    return {
+        **{k: v for k, v in updates.items() if k != "observations"},
+        "iteration": iteration,
+        "decision": "finish",
+        "decision_reason": result.get("analysis_summary", ""),
+        "next_symbol": None,
+        "candidate_callees": candidates,
+        "icall_resolution_status": resolution_status,
+        "icall_resolved": resolved,
+        "icall_resolution_reason": reason,
+        "icall_targets": candidates if resolved else [],
+        "observations": observations,
+        "visible_trace": [trace_item],
+        "status": "resolved",
+    }
 
 
 def index_symbol(state: ResolverState) -> ResolverState:
@@ -193,11 +331,29 @@ def index_symbol(state: ResolverState) -> ResolverState:
         )
         if callsite_def is not None:
             callsite_symbol = callsite_def["symbol"]
+            ident = bootlin_ident(
+                project=state["project"],
+                version=state["version"],
+                family=state["family"],
+                symbol=callsite_symbol,
+                project_root=state["project_root"],
+            )
+            refs = ident.get("references", [])
+            ref_source = "bootlin"
+            if not refs:
+                refs = find_local_symbol_references(
+                    project_root=state["project_root"],
+                    symbol=callsite_symbol,
+                    definition_path=callsite_def["path"],
+                    definition_line=int(callsite_def["line"]),
+                )
+                ref_source = "local"
             observations = [
                 (
                     "selected original callsite enclosing function "
                     f"{callsite_symbol} at {callsite_def['path']}:{callsite_def['line']}"
-                )
+                ),
+                f"{ref_source} references: {len(refs)}",
             ]
             if callsite_symbol != symbol:
                 observations.append(
@@ -209,7 +365,7 @@ def index_symbol(state: ResolverState) -> ResolverState:
                 "current_line": int(callsite_def["line"]),
                 "current_kind": callsite_def["type"],
                 "visited_symbols": [callsite_symbol] if callsite_symbol != symbol else [],
-                "bootlin_references": [],
+                "bootlin_references": refs,
                 "observations": observations,
             }
 
@@ -264,8 +420,8 @@ def retrieve_block(state: ResolverState) -> ResolverState:
         return {
             "status": "resolved",
             "decision": "finish",
-            "decision_reason": "max hops exceeded before retrieval; inconclusive",
-            "icall_resolution_status": "inconclusive",
+            "decision_reason": "max hops exceeded before retrieval; unresolved",
+            "icall_resolution_status": "unresolved",
             "icall_resolved": False,
             "icall_resolution_reason": "Analysis ended without a confident static resolution.",
             "candidate_callees": [],
@@ -400,9 +556,9 @@ def analyze_with_llm(state: ResolverState) -> ResolverState:
             "decision": "finish",
             "decision_reason": (
                 f"max iterations exceeded: iteration={state.get('iteration', 0)} "
-                f"max_iterations={state.get('max_iterations', 10)}; inconclusive"
+                f"max_iterations={state.get('max_iterations', 10)}; unresolved"
             ),
-            "icall_resolution_status": "inconclusive",
+            "icall_resolution_status": "unresolved",
             "icall_resolved": False,
             "icall_resolution_reason": "Analysis ended without a confident static resolution.",
             "candidate_callees": [],
@@ -454,7 +610,9 @@ def analyze_with_llm(state: ResolverState) -> ResolverState:
         prompt_text=bundle["prompt_text"],
         response_payload={
             "iteration": iteration,
+            "provider": bundle["provider"],
             "model": bundle["model"],
+            "system_prompt": bundle.get("system_prompt"),
             "icall_resolved": icall_resolved,
             "icall_resolution_status": icall_resolution_status,
             "icall_resolution_reason": icall_resolution_reason,
@@ -503,8 +661,8 @@ def jump_symbol(state: ResolverState) -> ResolverState:
         return {
             "status": "resolved",
             "decision": "finish",
-            "decision_reason": "LLM did not provide next_symbol; inconclusive",
-            "icall_resolution_status": "inconclusive",
+            "decision_reason": "LLM did not provide next_symbol; unresolved",
+            "icall_resolution_status": "unresolved",
             "icall_resolved": False,
             "icall_resolution_reason": "Analysis ended without a confident static resolution.",
             "candidate_callees": [],
@@ -520,10 +678,10 @@ def jump_symbol(state: ResolverState) -> ResolverState:
             "decision_reason": (
                 f"Loop detected at {next_sym}. The resolver reached a previously "
                 "visited symbol without new value-flow evidence, so this path is "
-                "classified as inconclusive instead of unresolved."
+                "classified as unresolved."
             ),
             "next_symbol": None,
-            "icall_resolution_status": "inconclusive",
+            "icall_resolution_status": "unresolved",
             "icall_resolved": False,
             "icall_resolution_reason": "Analysis ended without a confident static resolution.",
             "candidate_callees": [],
@@ -535,8 +693,8 @@ def jump_symbol(state: ResolverState) -> ResolverState:
         return {
             "status": "resolved",
             "decision": "finish",
-            "decision_reason": "max hops exceeded; inconclusive",
-            "icall_resolution_status": "inconclusive",
+            "decision_reason": "max hops exceeded; unresolved",
+            "icall_resolution_status": "unresolved",
             "icall_resolved": False,
             "icall_resolution_reason": "Analysis ended without a confident static resolution.",
             "candidate_callees": [],
@@ -557,7 +715,7 @@ def finish(state: ResolverState) -> ResolverState:
     visited = state.get("visited_symbols", [])
     traces = state.get("visible_trace", [])
     explicit_status = state.get("icall_resolution_status")
-    if explicit_status in {"unresolved", "not_icall", "inconclusive", "failed"}:
+    if explicit_status in {"unresolved", "not_icall", "failed"}:
         candidates = []
     else:
         candidates = list(dict.fromkeys(state.get("candidate_callees", [])))
@@ -650,6 +808,14 @@ def route_after_retrieve(state: ResolverState):
     return "expand_reference_candidates"
 
 
+def route_after_preclassify(state: ResolverState):
+    if state.get("status") == "resolved":
+        return "finish"
+    if state.get("status") == "failed":
+        return "fail"
+    return "index_symbol"
+
+
 def route_after_llm(state: ResolverState):
     decision = state.get("decision")
 
@@ -674,6 +840,7 @@ def build_graph():
 
     graph = StateGraph(ResolverState)
 
+    graph.add_node("preclassify_icall", preclassify_icall)
     graph.add_node("index_symbol", index_symbol)
     graph.add_node("retrieve_block", retrieve_block)
     graph.add_node("expand_reference_candidates", expand_reference_candidates)
@@ -682,7 +849,16 @@ def build_graph():
     graph.add_node("finish", finish)
     graph.add_node("fail", fail)
 
-    graph.add_edge(START, "index_symbol")
+    graph.add_edge(START, "preclassify_icall")
+    graph.add_conditional_edges(
+        "preclassify_icall",
+        route_after_preclassify,
+        {
+            "index_symbol": "index_symbol",
+            "finish": "finish",
+            "fail": "fail",
+        },
+    )
     graph.add_edge("index_symbol", "retrieve_block")
 
     graph.add_conditional_edges(

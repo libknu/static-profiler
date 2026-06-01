@@ -4,8 +4,9 @@ import os
 import re
 
 from .graph import build_graph
-from .analyzer import DEFAULT_MODEL_NAME
+from .analyzer import DEFAULT_MODEL_NAME, DEFAULT_PROVIDER, normalize_provider
 from .trace_store import prepare_output_dir, save_final_result, save_run_manifest
+from .deterministic import prepare_callsite_inputs
 
 
 DEFAULT_OUTPUT_ROOT = "/home/jiwoo/workspace/LLM_icall_resolver/outputs"
@@ -43,6 +44,7 @@ def build_initial_state(args, run_name: str, output_dir: str) -> dict:
         "project": args.project,
         "version": args.version,
         "family": args.family,
+        "provider": args.provider,
         "model": args.model,
 
         "caller_symbol": args.caller_symbol,
@@ -53,7 +55,7 @@ def build_initial_state(args, run_name: str, output_dir: str) -> dict:
 
         "visited_symbols": [args.caller_symbol],
         "retrieved_chunks": [],
-        "observations": [],
+        "observations": getattr(args, "prepared_observations", []),
         "visible_trace": [],
         "candidate_callees": [],
         "macro_context": [],
@@ -133,6 +135,11 @@ def main():
     parser.add_argument("--project", default="glibc")
     parser.add_argument("--version", default="glibc-2.41")
     parser.add_argument("--family", default="C")
+    parser.add_argument(
+        "--provider",
+        choices=["openai", "anthropic"],
+        default=os.environ.get("LLM_ICALL_PROVIDER"),
+    )
     parser.add_argument("--model", default=os.environ.get("LLM_ICALL_MODEL", DEFAULT_MODEL_NAME))
 
     parser.add_argument("--caller-symbol", default="key_call_socket")
@@ -157,10 +164,17 @@ def main():
     )
 
     args = parser.parse_args()
+    args.provider = normalize_provider(args.provider, args.model)
 
     run_name = derive_run_name(args)
     if args.icall_line is None:
         args.icall_line = infer_icall_line_from_name(run_name)
+    prepared = prepare_callsite_inputs(vars(args))
+    args.prepared_observations = prepared.get("observations", [])
+    if prepared.get("icall_location"):
+        args.icall_location = prepared["icall_location"]
+    if prepared.get("icall_expr"):
+        args.icall_expr = prepared["icall_expr"]
     output_dir = prepare_output_dir(args.output_root, run_name)
 
     initial_state = build_initial_state(args, run_name=run_name, output_dir=output_dir)

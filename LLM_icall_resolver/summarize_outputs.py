@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
 
-RESOLUTION_STATUSES = ("resolved", "unresolved", "not_icall", "inconclusive", "failed")
+RESOLUTION_STATUSES = ("resolved", "unresolved", "not_icall", "failed")
+ROUND_DIR_RE = re.compile(r"^round(\d+)$")
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -47,6 +50,8 @@ def looks_not_icall(data: dict[str, Any]) -> bool:
 
 def classify_result(data: dict[str, Any]) -> str:
     explicit = data.get("icall_resolution_status")
+    if explicit == "inconclusive":
+        return "unresolved"
     if explicit in RESOLUTION_STATUSES:
         return explicit
 
@@ -92,6 +97,155 @@ def iter_run_results(outputs_dir: Path):
             yield run_dir.name, "old" if run_dir.name.startswith("old.") else "current", "failed", None, f"could not read final.json: {exc}"
             continue
         yield run_dir.name, "old" if run_dir.name.startswith("old.") else "current", classify_result(data), data, None
+
+
+def round_index_from_name(name: str) -> int:
+    match = ROUND_DIR_RE.match(name)
+    if not match:
+        return 0
+    return int(match.group(1))
+
+
+def is_cascade_outputs_root(outputs_dir: Path) -> bool:
+    return any(
+        child.is_dir() and ROUND_DIR_RE.match(child.name)
+        for child in outputs_dir.iterdir()
+    )
+
+
+def case_id_for_result(run_name: str, data: dict[str, Any] | None) -> str:
+    if data:
+        case_id = data.get("case_id")
+        if case_id:
+            return str(case_id)
+    case_id = run_name.removeprefix("old.")
+    return re.sub(r"\.\d+$", "", case_id)
+
+
+def iter_cascade_results(outputs_root: Path):
+    for round_dir in sorted(outputs_root.iterdir(), key=lambda p: (round_index_from_name(p.name), p.name)):
+        if not round_dir.is_dir() or not ROUND_DIR_RE.match(round_dir.name):
+            continue
+
+        fallback_round_index = round_index_from_name(round_dir.name)
+        for final_path in sorted(round_dir.glob("*/final.json")):
+            run_dir = final_path.parent
+            bucket = "old" if run_dir.name.startswith("old.") else "current"
+            try:
+                data = load_json(final_path)
+                status = classify_result(data)
+                error = None
+            except Exception as exc:
+                data = None
+                status = "failed"
+                error = f"could not read final.json: {exc}"
+
+            if data is not None:
+                data["_run_name"] = run_dir.name
+                data["_round"] = data.get("run_round") or round_dir.name
+                data["_round_index"] = int(data.get("run_round_index") or fallback_round_index)
+                data["_final_path"] = str(final_path)
+
+            yield (
+                run_dir.name,
+                bucket,
+                status,
+                data,
+                error,
+                round_dir.name,
+                int((data or {}).get("run_round_index") or fallback_round_index),
+                str(final_path),
+            )
+
+
+def base_case_ids_from_round1(rows: list[tuple]) -> set[str]:
+    return {
+        case_id_for_result(run_name, data)
+        for run_name, bucket, _status, data, _error, source_round, _round_index, _final_path in rows
+        if source_round == "round1" and bucket == "current" and data is not None
+    }
+
+
+def latest_cascade_rows(rows: list[tuple], base_case_ids: set[str] | None = None):
+    latest: dict[str, tuple] = {}
+    for row in rows:
+        run_name, bucket, _status, data, _error, _round_name, round_index, final_path = row
+        case_id = case_id_for_result(run_name, data)
+        if base_case_ids is not None and case_id not in base_case_ids:
+            continue
+        previous = latest.get(case_id)
+        if previous is None:
+            latest[case_id] = row
+            continue
+
+        previous_round_index = previous[6]
+        previous_bucket_rank = 1 if previous[1] == "current" else 0
+        previous_final_path = previous[7]
+        bucket_rank = 1 if bucket == "current" else 0
+        if (round_index, bucket_rank, final_path) >= (
+            previous_round_index,
+            previous_bucket_rank,
+            previous_final_path,
+        ):
+            latest[case_id] = row
+    return [latest[case_id] for case_id in sorted(latest)]
+
+
+def basic_rows(cascade_rows: list[tuple]) -> list[tuple[str, str, str, dict[str, Any] | None, str | None]]:
+    return [row[:5] for row in cascade_rows]
+
+
+def case_id_rows(cascade_rows: list[tuple]) -> list[tuple[str, str, str, dict[str, Any] | None, str | None]]:
+    return [
+        (case_id_for_result(run_name, data), bucket, status, data, error)
+        for run_name, bucket, status, data, error, *_rest in cascade_rows
+    ]
+
+
+def write_latest_case_results_csv(stats_dir: Path, round_name: str, rows: list[tuple]) -> Path:
+    path = stats_dir / f"{round_name}_case_results.csv"
+    fields = [
+        "case_id",
+        "latest_round",
+        "latest_round_index",
+        "run_name",
+        "bucket",
+        "status",
+        "caller_symbol",
+        "icall_location",
+        "icall_line",
+        "icall_expr",
+        "num_candidates",
+        "icall_targets",
+        "reason",
+        "final_json",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for run_name, _bucket, status, data, error, source_round, round_index, final_path in rows:
+            targets = []
+            if data:
+                targets = [str(x) for x in (data.get("icall_targets") or data.get("candidate_callees") or [])]
+            writer.writerow(
+                {
+                    "case_id": case_id_for_result(run_name, data),
+                    "latest_round": source_round,
+                    "latest_round_index": round_index,
+                    "run_name": run_name,
+                    "bucket": _bucket,
+                    "status": status,
+                    "caller_symbol": (data or {}).get("caller_symbol", ""),
+                    "icall_location": (data or {}).get("icall_location", ""),
+                    "icall_line": (data or {}).get("icall_line", ""),
+                    "icall_expr": (data or {}).get("icall_expr", ""),
+                    "num_candidates": len(targets),
+                    "icall_targets": ";".join(targets),
+                    "reason": get_reason(data, error),
+                    "final_json": final_path,
+                }
+            )
+    return path
 
 
 def percent(count: int, total: int) -> str:
@@ -174,7 +328,6 @@ def write_status_lists(
         runs_by_status.get("failed", [])
         + runs_by_status.get("unresolved", [])
         + runs_by_status.get("not_icall", [])
-        + runs_by_status.get("inconclusive", [])
     )
     pending_path.write_text(
         "".join(f"{run_name}\n" for run_name in pending_runs),
@@ -285,6 +438,71 @@ def print_summary(outputs_dir: Path, stats_dir: Path, round_name: str, details: 
                 print("- (none)")
 
 
+def print_cascade_latest_summary(outputs_root: Path, stats_dir: Path, round_name: str, details: bool) -> None:
+    cascade_rows = list(iter_cascade_results(outputs_root))
+    base_case_ids = base_case_ids_from_round1(cascade_rows)
+    latest_rows = latest_cascade_rows(cascade_rows, base_case_ids=base_case_ids)
+    rows = case_id_rows(latest_rows)
+    counts, runs_by_status, reasons_by_run, errors = summarize_bucket(rows)
+
+    stats_dir.mkdir(parents=True, exist_ok=True)
+    write_status_lists(stats_dir, round_name, runs_by_status, reasons_by_run)
+    stat_path = write_round_stat(
+        stats_dir,
+        round_name,
+        outputs_root,
+        counts,
+        sum(counts.values()),
+        reasons_by_run,
+        runs_by_status,
+    )
+    csv_path = write_latest_case_results_csv(stats_dir, round_name, latest_rows)
+
+    round_counts: Counter[str] = Counter(row[5] for row in latest_rows)
+
+    total_executions = len(cascade_rows)
+    total_cases = len(latest_rows)
+    print(f"Outputs root: {outputs_root}")
+    print(f"Stats directory: {stats_dir}")
+    print(f"Summary mode: latest result per unique case")
+    print(f"Final result policy: group by case_id/run_name, pick largest round index")
+    print(f"Total executions with final.json: {total_executions}")
+    print(f"Base unique cases from round1 current final.json: {len(base_case_ids)}")
+    print(f"Unique cases with latest final result: {total_cases}")
+    print()
+    print("Latest result source round:")
+    for source_round, count in sorted(round_counts.items(), key=lambda item: round_index_from_name(item[0])):
+        print(f"- {source_round}: {count} ({percent(count, total_cases)})")
+    print()
+    print("Final resolution statistics:")
+    for status in RESOLUTION_STATUSES:
+        count = counts[status]
+        print(f"- {status}: {count} ({percent(count, total_cases)})")
+    print()
+    print("Wrote latest-case outputs:")
+    for status in RESOLUTION_STATUSES:
+        print(f"- {stats_dir / f'{round_name}.{status}.list'}")
+    print(f"- {stats_dir / f'{round_name}.pending.list'}")
+    print(f"- {stat_path}")
+    print(f"- {csv_path}")
+
+    if errors:
+        print()
+        print("Read errors:")
+        for run_name, error in errors:
+            print(f"- {run_name}: {error}")
+
+    if details:
+        print()
+        print("Latest cases by status:")
+        for status in RESOLUTION_STATUSES:
+            print(f"[{status}]")
+            for run_name in runs_by_status.get(status, []):
+                print(f"- {run_name}")
+            if not runs_by_status.get(status):
+                print("- (none)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Summarize icall resolver outcomes under an outputs directory."
@@ -312,6 +530,14 @@ def main() -> None:
         default="round1",
         help="label used in generated stat/list filenames",
     )
+    parser.add_argument(
+        "--latest-cascade",
+        action="store_true",
+        help=(
+            "treat outputs_dir as a root containing round1/round2/round3 directories "
+            "and summarize the latest result for each unique case"
+        ),
+    )
     args = parser.parse_args()
 
     outputs_dir = args.outputs_dir
@@ -319,12 +545,23 @@ def main() -> None:
         raise SystemExit(f"outputs directory does not exist: {outputs_dir}")
 
     stats_dir = args.stats_dir if args.stats_dir is not None else outputs_dir.parent / "stats"
-    print_summary(
-        outputs_dir=outputs_dir,
-        stats_dir=stats_dir,
-        round_name=args.round_name,
-        details=args.details,
-    )
+    if args.latest_cascade or is_cascade_outputs_root(outputs_dir):
+        round_name = args.round_name
+        if round_name == "round1":
+            round_name = "latest"
+        print_cascade_latest_summary(
+            outputs_root=outputs_dir,
+            stats_dir=stats_dir,
+            round_name=round_name,
+            details=args.details,
+        )
+    else:
+        print_summary(
+            outputs_dir=outputs_dir,
+            stats_dir=stats_dir,
+            round_name=args.round_name,
+            details=args.details,
+        )
 
 
 if __name__ == "__main__":

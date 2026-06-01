@@ -164,6 +164,7 @@ WORKSPACE_ROOT="${{WORKSPACE_ROOT:-$HOME/workspace}}"
 PROJECT_ROOT="${{PROJECT_ROOT:-$WORKSPACE_ROOT/glibc-src/glibc-2.41}}"
 PYTHON_BIN="${{PYTHON_BIN:-python3}}"
 MODEL_NAME="${{LLM_ICALL_MODEL:-gpt-5.4}}"
+PROVIDER="${{LLM_ICALL_PROVIDER:-openai}}"
 
 CASE_NAME="$(basename "$0" .sh)"
 
@@ -174,6 +175,7 @@ exec "$PYTHON_BIN" -m LLM_icall_resolver.main \\
   --project glibc \\
   --version glibc-2.41 \\
   --family C \\
+  --provider "$PROVIDER" \\
   --model "$MODEL_NAME" \\
   --caller-symbol {shell_escape(func)} \\
   --icall-expr {shell_escape(icall_expr)} \\
